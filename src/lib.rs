@@ -49,9 +49,6 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::{mem, ptr, usize};
 
-#[cfg(test)]
-mod test;
-
 pub struct Subject<T> {
     layout: Mutex<SubjectLayout>,
     _phantom: PhantomData<*const T>,
@@ -208,7 +205,6 @@ impl SubjectLayout {
         let offset = (self.size + align - 1) & !(align - 1);
         self.size = offset + size;
         self.align = max(self.align, align);
-        println!("Alloc {} {}", offset, size);
         return offset;
     }
 
@@ -286,7 +282,7 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
 pub struct Extended<'a, T> {
     pub value: T,
     subject: &'a Subject<T>,
-    data: Data,
+    data: Mutex<ExtendedData>,
 }
 
 pub type Dynamic<'a> = Extended<'a, ()>;
@@ -296,7 +292,7 @@ impl<'a, T> Extended<'a, T> {
         Extended {
             value,
             subject,
-            data: Data::new(subject.pin_layout()),
+            data: Mutex::new(ExtendedData::new(subject.pin_layout())),
         }
     }
 
@@ -311,21 +307,31 @@ impl<'a, T> Extended<'a, T> {
         let init_word_offset = (index.init_bit_offset / 8) & !(mem::align_of::<usize>() - 1);
         let init_word_bit = index.init_bit_offset - (init_word_offset * 8);
         unsafe {
-            let init_word = self
-                .data
-                .get_ptr(get_data_layout, init_word_offset, mem::size_of::<usize>())
+            let mut data = self.data.lock().unwrap();
+            let init_word = data
+                .get_ptr(get_data_layout, init_word_offset)
                 .cast::<usize>()
                 .as_mut();
-            let value_ptr = self
-                .data
-                .get_ptr(get_data_layout, index.offset, mem::size_of::<P>())
-                .cast::<P>();
+            let value_ptr = data.get_ptr(get_data_layout, index.offset).cast::<P>();
+
+            // Drop the lock as soon as we have the pointers we need. We don't want to hold the
+            // lock during initialization, since other properties within the same object can
+            // be referenced.
+            drop(data);
+
             let init_bit = (*init_word & (1 << init_word_bit)) != 0;
             if !init_bit {
                 // Do initialization
                 let init_value = index.initer.init(&self);
-                ptr::write(value_ptr.as_ptr(), init_value);
-                *init_word |= 1 << init_word_bit;
+
+                // Lock to write the initial value
+                let data = self.data.lock().unwrap();
+                let init_bit = (*init_word & (1 << init_word_bit)) != 0;
+                if !init_bit { 
+                    ptr::write(value_ptr.as_ptr(), init_value);
+                    *init_word |= 1 << init_word_bit;
+                }
+                drop(data);
             }
             return value_ptr;
         }
@@ -356,82 +362,156 @@ impl<'a, 'b, T, P, I: Init<T, P>> IndexMut<&'b Property<'a, T, P, I>> for Extend
     }
 }
 
-struct Data {
-    head_ptr: NonNull<u8>,
+impl<'a, T> Drop for Extended<'a, T> {
+    fn drop(&mut self) {
+        let mut data = self.data.lock().unwrap();
+        let layout = self.subject.layout.lock().unwrap();
+        for prop in layout.drop_props.iter() {
+            let get_data_layout = || self.subject.pin_layout();
+            let init_word_offset = (prop.init_bit_offset / 8) & !(mem::align_of::<usize>() - 1);
+            let init_word_bit = prop.init_bit_offset - (init_word_offset * 8);
+            unsafe {
+                let init_word = data
+                    .get_ptr(get_data_layout, init_word_offset)
+                    .cast::<usize>()
+                    .as_mut();
+                let init_bit = (*init_word & (1 << init_word_bit)) != 0;
+                if init_bit {
+                    // Drop property
+                    let value_ptr = data.get_ptr(get_data_layout, prop.offset);
+                    (prop.drop)(value_ptr);
+                }
+            }
+        }
+    }
 }
 
-struct ChunkHeader {
-    overflow_ptr: *mut u8,
-    chunk_layout: Layout,
-    data_ptr: *mut u8,
+/// The internal representation of the data for a [Extended]. Note that, unlike [Vec], we can't move
+/// underlying data when new properties are added. That's because properties can be initialized
+/// from a shared borrow at the same time that pre-existing properties are being referenced. This
+/// limits are design choices here considerably. The current implementation stores data in either
+/// a "head" chunk or an "overflow" chunk. The "head" chunk consists of the properties that
+/// existed when the [Extended] was created, and the "overflow" chunks contain blocks of new
+/// properties that were added later on.
+struct ExtendedData {
+    head_chunk: Chunk,
+    overflow_chunks: Vec<Chunk>,
+}
+
+/// Describes a chunk within [ExtendedData].
+struct Chunk {
+    ptr: NonNull<u8>,
+    layout: Layout,
     data_end: usize,
 }
 
-impl Data {
-    fn new(data_layout: Layout) -> Self {
-        unsafe {
-            Data {
-                head_ptr: Self::alloc_chunk(0, data_layout),
-            }
+impl ExtendedData {
+    fn new(head_layout: Layout) -> Self {
+        ExtendedData {
+            head_chunk: Chunk::new(head_layout, head_layout.size()),
+            overflow_chunks: Vec::new(),
         }
     }
 
-    unsafe fn alloc_chunk(data_start: usize, data_layout: Layout) -> NonNull<u8> {
-        let data_end = data_layout.size();
-        let chunk_size = data_end - data_start;
-        let chunk_layout = Layout::from_size_align_unchecked(chunk_size, data_layout.align());
-        let header_layout = Layout::new::<ChunkHeader>();
-        let (chunk_layout, offset) = header_layout.extend(chunk_layout).unwrap();
-        let ptr = alloc_zeroed(chunk_layout);
-        let ptr = match NonNull::new(ptr) {
-            Some(ptr) => ptr,
-            None => handle_alloc_error(chunk_layout),
+    /// Gets a pointer to a particular property within the [ExtendedData], given the offset of the
+    /// property within the entire [SubjectLayout]. If an additional chunk needs to be allocated,
+    /// `get_data_layout` will be used to get the latest size/alignment of the [SubjectLayout].
+    fn get_ptr(&mut self, get_data_layout: impl FnOnce() -> Layout, offset: usize) -> NonNull<u8> {
+        // Is the data in the head chunk?
+        if offset < self.head_chunk.data_end {
+            unsafe {
+                return NonNull::new_unchecked(self.head_chunk.ptr.as_ptr().add(offset));
+            }
+        }
+
+        // Is the data in an existing overflow chunk?
+        let mut overflow_data_end = self.head_chunk.data_end;
+        match self.overflow_chunks.last() {
+            Some(last_overflow_chunk) => {
+                overflow_data_end = last_overflow_chunk.data_end;
+                if offset < last_overflow_chunk.data_end {
+                    // Use binary search to figure out which chunk
+                    let mut lo_chunk_index = 0;
+                    let mut hi_chunk_index = self.overflow_chunks.len() - 1;
+                    let mut chunk_data_start = self.head_chunk.data_end;
+                    loop {
+                        if !(lo_chunk_index < hi_chunk_index) {
+                            break;
+                        }
+                        let mid_chunk_index = (lo_chunk_index + hi_chunk_index) / 2;
+                        let mid_chunk = &self.overflow_chunks[mid_chunk_index];
+                        if offset < mid_chunk.data_end {
+                            hi_chunk_index = mid_chunk_index;
+                        } else {
+                            chunk_data_start = mid_chunk.data_end;
+                            lo_chunk_index = mid_chunk_index + 1;
+                        }
+                    }
+                    unsafe {
+                        let overflow_chunk = &self.overflow_chunks[lo_chunk_index];
+                        return NonNull::new_unchecked(
+                            overflow_chunk
+                                .ptr
+                                .as_ptr()
+                                .sub(chunk_data_start)
+                                .add(offset),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Create a new overflow chunk
+        let data_layout = get_data_layout();
+        let new_data_end = data_layout.size();
+        assert!(offset < new_data_end);
+        let chunk_layout =
+            Layout::from_size_align(new_data_end - overflow_data_end, data_layout.align()).unwrap();
+        let overflow_chunk = Chunk::new(chunk_layout, new_data_end);
+        let result = unsafe {
+            NonNull::new_unchecked(
+                overflow_chunk
+                    .ptr
+                    .as_ptr()
+                    .sub(overflow_data_end)
+                    .add(offset),
+            )
         };
-        let data_ptr = ptr.as_ptr().add(offset).sub(data_start);
-        ptr::write(
-            ptr.cast::<ChunkHeader>().as_ptr(),
-            ChunkHeader {
-                overflow_ptr: ptr::null_mut(),
-                chunk_layout,
-                data_ptr,
-                data_end,
-            },
-        );
-        return ptr;
+        self.overflow_chunks.push(overflow_chunk);
+        return result;
     }
+}
 
-    unsafe fn get_ptr(
-        &self,
-        get_data_layout: impl FnOnce() -> Layout,
-        offset: usize,
-        size: usize,
-    ) -> NonNull<u8> {
-        let header = self.head_ptr.cast::<ChunkHeader>().as_mut();
-        return Self::get_ptr_in_chunk(header, get_data_layout, offset, size);
-    }
-
-    unsafe fn get_ptr_in_chunk(
-        header: &mut ChunkHeader,
-        get_data_layout: impl FnOnce() -> Layout,
-        offset: usize,
-        size: usize,
-    ) -> NonNull<u8> {
-        if offset + size <= header.data_end {
-            return NonNull::new_unchecked(header.data_ptr.add(offset));
+impl Chunk {
+    fn new(layout: Layout, data_end: usize) -> Self {
+        let ptr = if layout.size() > 0 {
+            unsafe {
+                match NonNull::new(alloc_zeroed(layout)) {
+                    Some(ptr) => ptr,
+                    None => handle_alloc_error(layout),
+                }
+            }
         } else {
-            match NonNull::new(header.overflow_ptr) {
-                Some(overflow_ptr) => {
-                    let overflow_header = overflow_ptr.cast::<ChunkHeader>().as_mut();
-                    return Self::get_ptr_in_chunk(overflow_header, get_data_layout, offset, size);
-                }
-                None => {
-                    let overflow_ptr = Self::alloc_chunk(header.data_end, get_data_layout());
-                    let overflow_header = overflow_ptr.cast::<ChunkHeader>().as_mut();
-                    header.overflow_ptr = overflow_ptr.as_ptr();
-                    assert!(offset + size <= overflow_header.data_end);
-                    return NonNull::new_unchecked(overflow_header.data_ptr.add(offset));
-                }
+            NonNull::dangling()
+        };
+        Chunk {
+            ptr,
+            layout,
+            data_end,
+        }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if self.layout.size() > 0 {
+            unsafe {
+                dealloc(self.ptr.as_ptr(), self.layout);
             }
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
