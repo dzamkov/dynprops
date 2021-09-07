@@ -24,22 +24,6 @@
 //! let prop_d = subject.new_prop_fn_init(|obj| obj[&prop_b].len());
 //! assert_eq!(obj[&prop_d], 6);
 //! ```
-//!
-//! ## Property Lifetime
-//! The lifetime of a reference to a property on an object is limited by both the object and
-//! the property itself. This allows memory to be reclaimed/reused for properties that have been
-//! dropped.
-//!
-//! ```compile_fail
-//! use dynprops::{Subject, Dynamic};
-//!
-//! let subject = Subject::new();
-//! let prop = subject.new_prop_const_init(5);
-//! let mut obj = Dynamic::new(&subject);
-//! let x = &mut obj[&prop];
-//! drop(prop);
-//! *x = 10; // ERROR: This reference requires prop to be alive
-//! ```
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
@@ -49,9 +33,18 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::{mem, ptr, usize};
 
+/// Identifies a category of objects and a dynamic set of [`Property`]s that apply to those objects.
+/// New properties can be introduced into the subject at any time using [`Subject::new_prop`]
+/// and its derivatives. When accessing a property of an object, the subject of the property
+/// must match the subject of the object.
+///
+/// ## Lifetime
+/// The [`Subject`] must be alive for the entire duration that any [`Property`], [`Extended`] or
+/// [`Dynamic`] are associated with it. This is enforced by a lifetime parameter on those types. In
+/// practice, subjects will usually be bound to the `'static` lifetime.
 pub struct Subject<T> {
     layout: Mutex<SubjectLayout>,
-    _phantom: PhantomData<*const T>,
+    _phantom: PhantomData<fn(T)>,
 }
 
 struct SubjectLayout {
@@ -78,6 +71,7 @@ struct PropertyInfo {
 }
 
 impl<T> Subject<T> {
+    /// Creates a new subject.
     pub fn new() -> Self {
         Subject {
             layout: Mutex::new(SubjectLayout {
@@ -90,6 +84,8 @@ impl<T> Subject<T> {
         }
     }
 
+    /// Creates a new property within this subject. An [`Init`] must be supplied to specify how the
+    /// initial value of the property is determined.
     pub fn new_prop<'a, P, I: Init<T, P>>(&'a self, initer: I) -> Property<'a, T, P, I> {
         let info = self.alloc_prop::<P>();
         return Property {
@@ -101,14 +97,37 @@ impl<T> Subject<T> {
         };
     }
 
+    /// Creates a new property within this subject. Upon initialization, the property will have the
+    /// default value (as defined by [`Default::default()`]) for type `P`.
     pub fn new_prop_default_init<'a, P: Default>(&'a self) -> DefaultInitProperty<'a, T, P> {
         self.new_prop(DefaultInit)
     }
 
+    /// Creates a new property within this subject. Upon initialization, the property will have the
+    /// given value.
     pub fn new_prop_const_init<'a, P: Clone>(&'a self, value: P) -> ConstInitProperty<'a, T, P> {
         self.new_prop(ConstInit { value })
     }
 
+    /// Creates a new property within this subject. Upon initialization, the value of the property
+    /// will be determined by executing the given closure.
+    ///
+    /// Since the closure takes the object itself, the initializer may reference the base value or
+    /// any other property that has been defined on [`Subject`]. For example:
+    /// ```
+    /// use dynprops::{Subject, Extended};
+    ///
+    /// let subject = Subject::new();
+    /// let prop_value = subject.new_prop_fn_init(|obj| obj.value);
+    /// let prop_double_value = subject.new_prop_fn_init(|obj| obj[&prop_value] * 2);
+    /// let prop_square_value = subject.new_prop_fn_init(|obj| obj[&prop_value] * obj[&prop_value]);
+    /// let obj = Extended::new_extend(20, &subject);
+    /// assert_eq!(obj[&prop_value], 20);
+    /// assert_eq!(obj[&prop_double_value], 40);
+    /// assert_eq!(obj[&prop_square_value], 400);
+    /// ```
+    /// The constraints on property lifetimes ensure that circular references between property
+    /// initializers are impossible.
     pub fn new_prop_fn_init<'a, P, F: Fn(&Extended<T>) -> P>(
         &'a self,
         init_fn: F,
@@ -116,10 +135,14 @@ impl<T> Subject<T> {
         self.new_prop(FnInit { init_fn })
     }
 
+    /// Creates a new property within this subject. This works identically to
+    /// [`Self::new_prop_default_init`], but returns a [`DynInitProperty`].
     pub fn new_prop_dyn_default_init<'a, P: Default>(&'a self) -> DynInitProperty<'a, T, P> {
         self.new_prop(Box::new(DefaultInit)) // TODO: Reusable box
     }
 
+    /// Creates a new property within this subject. This works identically to
+    /// [`Self::new_prop_const_init`], but returns a [`DynInitProperty`].
     pub fn new_prop_dyn_const_init<'a, P: 'a + Sync + Clone>(
         &'a self,
         value: P,
@@ -127,6 +150,8 @@ impl<T> Subject<T> {
         self.new_prop(Box::new(ConstInit { value }))
     }
 
+    /// Creates a new property within this subject. This works identically to
+    /// [`Self::new_prop_fn_init`], but returns a [`DynInitProperty`].
     pub fn new_prop_dyn_fn_init<'a, P>(
         &'a self,
         init_fn: impl 'a + Sync + Fn(&Extended<T>) -> P,
@@ -153,8 +178,6 @@ impl<T> Subject<T> {
         }
     }
 }
-
-unsafe impl<T> Sync for Subject<T> {}
 
 impl SubjectLayout {
     fn alloc_prop<P>(&mut self) -> PropertyInfo {
@@ -213,23 +236,50 @@ impl SubjectLayout {
     }
 }
 
+/// Identifies a property that is present on objects of the appropriate [`Subject`].
+///
+/// ## Property Lifetime
+/// The lifetime of a reference to a property on an object is limited by both the object and
+/// the property itself. This allows memory to be reclaimed/reused for properties that have been
+/// dropped.
+///
+/// ```compile_fail
+/// use dynprops::{Subject, Dynamic};
+///
+/// let subject = Subject::new();
+/// let prop = subject.new_prop_const_init(5);
+/// let mut obj = Dynamic::new(&subject);
+/// let x = &mut obj[&prop];
+/// drop(prop);
+/// *x = 10; // ERROR: This reference requires prop to be alive
+/// ```
 pub struct Property<'a, T, P, I: 'a + Init<T, P>> {
     subject: &'a Subject<T>,
     offset: usize,
     init_bit_offset: usize,
     initer: I,
-    _phantom: PhantomData<*const P>,
+    _phantom: PhantomData<fn() -> P>,
 }
 
+/// A shortcut for a [`Property`] that is initialized by a [`DefaultInit`].
 pub type DefaultInitProperty<'a, T, P> = Property<'a, T, P, DefaultInit>;
 
+/// A shortcut for a [`Property`] that is initialized by a [`ConstInit`].
 pub type ConstInitProperty<'a, T, P> = Property<'a, T, P, ConstInit<P>>;
 
+/// A shortcut for a [`Property`] that is initialized by a [`FnInit`].
 pub type FnInitProperty<'a, T, P, F> = Property<'a, T, P, FnInit<F>>;
 
+/// A shortcut for a [`Property`] that is initialized by a [`DynInit`].
 pub type DynInitProperty<'a, T, P> = Property<'a, T, P, DynInit<'a, T, P>>;
 
-unsafe impl<'a, T, P, I: Sync + Init<T, P>> Sync for Property<'a, T, P, I> {}
+impl<'a, T, P, I: Init<T, P>> Property<'a, T, P, I> {
+    /// Gets the [`Subject`] this property is associated with. This defines which [`Dynamic`]s and
+    /// [`Extended`]s contain this property.
+    pub fn subject(&self) -> &Subject<T> {
+        self.subject
+    }
+}
 
 impl<'a, T, P, I: Init<T, P>> Drop for Property<'a, T, P, I> {
     fn drop(&mut self) {
@@ -237,22 +287,26 @@ impl<'a, T, P, I: Init<T, P>> Drop for Property<'a, T, P, I> {
     }
 }
 
-/// Defines how a [Property] is initialized when first accessed.
+/// Defines how a [`Property`] is initialized when first accessed.
 pub trait Init<T, P> {
     /// Creates the initial value for the property on the given object.
     fn init(&self, obj: &Extended<T>) -> P;
 }
 
+/// An [`Init`] which initializes values using [`Default::default()`].
 pub struct DefaultInit;
 
+/// An [`Init`] which initializes values by cloning a given value.
 pub struct ConstInit<P: Clone> {
-    value: P,
+    pub value: P,
 }
 
+/// An [`Init`] which initializes values by executing a closure.
 pub struct FnInit<F> {
-    init_fn: F,
+    pub init_fn: F,
 }
 
+/// An [`Init`] that uses dynamic dispatch to defer to another [`Init`] at runtime.
 pub type DynInit<'a, T, P> = Box<dyn 'a + Sync + Init<T, P>>;
 
 impl<T, P, F: Fn(&Extended<T>) -> P> Init<T, P> for FnInit<F> {
@@ -279,21 +333,62 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
     }
 }
 
+/// Extends a value of type `T` with properties defined in a particular [`Subject<T>`].
+///
+/// Property values are accessed by index, like so:
+/// ```
+/// use dynprops::{Subject, Extended};
+///
+/// let subject = Subject::new();
+/// let prop = subject.new_prop_default_init();
+/// let mut obj = Extended::new_extend(5, &subject);
+/// obj[&prop] = "Foo";
+/// assert_eq!(obj[&prop], "Foo");
+/// ```
+///
+/// The base value of an [`Extended`] object can always be accessed through the `value` field:
+/// ```
+/// use dynprops::{Subject, Extended};
+///
+/// let subject = Subject::new();
+/// let mut obj = Extended::new_extend(5, &subject);
+/// obj.value = 15;
+/// assert_eq!(obj.value, 15);
+/// ```
 pub struct Extended<'a, T> {
     pub value: T,
     subject: &'a Subject<T>,
     data: Mutex<ExtendedData>,
 }
 
+/// An object consisting entirely of dynamic properties defined in a particular [`Subject`].
+///
+/// Property values are accessed by index, like so:
+/// ```
+/// use dynprops::{Subject, Dynamic};
+/// let subject = Subject::new();
+/// let prop = subject.new_prop_default_init();
+/// let mut obj = Dynamic::new(&subject);
+/// obj[&prop] = "Bar";
+/// assert_eq!(obj[&prop], "Bar");
+/// ```
 pub type Dynamic<'a> = Extended<'a, ()>;
 
 impl<'a, T> Extended<'a, T> {
+    /// Creates an [`Extended`] wrapper over the given value. This extends it with all of the
+    /// [`Property`]s defined on `subject`.
     pub fn new_extend(value: T, subject: &'a Subject<T>) -> Self {
         Extended {
             value,
             subject,
             data: Mutex::new(ExtendedData::new(subject.pin_layout())),
         }
+    }
+
+    /// Gets the [`Subject`] this object is associated with. This defines which [`Property`]s are
+    /// available on the object.
+    pub fn subject(&self) -> &Subject<T> {
+        self.subject
     }
 
     fn index_raw<P, I: Init<T, P>>(&self, index: &Property<'a, T, P, I>) -> NonNull<P> {
@@ -327,7 +422,7 @@ impl<'a, T> Extended<'a, T> {
                 // Lock to write the initial value
                 let data = self.data.lock().unwrap();
                 let init_bit = (*init_word & (1 << init_word_bit)) != 0;
-                if !init_bit { 
+                if !init_bit {
                     ptr::write(value_ptr.as_ptr(), init_value);
                     *init_word |= 1 << init_word_bit;
                 }
@@ -339,6 +434,7 @@ impl<'a, T> Extended<'a, T> {
 }
 
 impl<'a> Dynamic<'a> {
+    /// Creates a new [`Dynamic`] object.
     pub fn new(subject: &'a Subject<()>) -> Self {
         Self::new_extend((), subject)
     }
