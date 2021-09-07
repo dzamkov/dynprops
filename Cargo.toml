@@ -2,6 +2,11 @@
 name = "dynprops"
 version = "0.1.0"
 edition = "2018"
+description = "Creating and extending objects with typed dynamic properties"
+repository = "https://github.com/dzamkov/dynprops"
+license = "MIT OR Apache-2.0"
+keywords = ["dynamic", "properties"]
+categories = ["data-structures"]
 
 [dependencies]
 
