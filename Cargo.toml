@@ -12,3 +12,4 @@ categories = ["data-structures"]
 
 [dev-dependencies]
 lazy_static = "1.4.0"
+static_init = "1.0.1"
