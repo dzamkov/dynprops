@@ -7,12 +7,15 @@ struct Context {
 
 lazy_static! {
     static ref CONTEXT: Subject<Context> = Subject::new();
-    static ref DOUBLE: DynInitProperty<'static, Context, i32> =
-        CONTEXT.new_prop_dyn_fn_init(|context| { context.value.param * 2 });
-    static ref SQUARE: DynInitProperty<'static, Context, i32> =
-        CONTEXT.new_prop_dyn_fn_init(|context| { context.value.param * context.value.param });
-    static ref SQUARE_PLUS_DOUBLE: DynInitProperty<'static, Context, i32> =
-        CONTEXT.new_prop_dyn_fn_init(|context| { context[&SQUARE] + context[&DOUBLE] });
+    static ref DOUBLE: DynInitProperty<'static, Context, i32> = CONTEXT
+        .new_prop_fn_init(|context| { context.value.param * 2 })
+        .into_dyn_init();
+    static ref SQUARE: DynInitProperty<'static, Context, i32> = CONTEXT
+        .new_prop_fn_init(|context| { context.value.param * context.value.param })
+        .into_dyn_init();
+    static ref SQUARE_PLUS_DOUBLE: DynInitProperty<'static, Context, i32> = CONTEXT
+        .new_prop_fn_init(|context| { context[&SQUARE] + context[&DOUBLE] })
+        .into_dyn_init();
 }
 
 #[test]

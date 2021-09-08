@@ -135,30 +135,6 @@ impl<T> Subject<T> {
         self.new_prop(FnInit { init_fn })
     }
 
-    /// Creates a new property within this subject. This works identically to
-    /// [`Self::new_prop_default_init`], but returns a [`DynInitProperty`].
-    pub fn new_prop_dyn_default_init<'a, P: Default>(&'a self) -> DynInitProperty<'a, T, P> {
-        self.new_prop(Box::new(DefaultInit)) // TODO: Reusable box
-    }
-
-    /// Creates a new property within this subject. This works identically to
-    /// [`Self::new_prop_const_init`], but returns a [`DynInitProperty`].
-    pub fn new_prop_dyn_const_init<'a, P: 'a + Sync + Clone>(
-        &'a self,
-        value: P,
-    ) -> DynInitProperty<'a, T, P> {
-        self.new_prop(Box::new(ConstInit { value }))
-    }
-
-    /// Creates a new property within this subject. This works identically to
-    /// [`Self::new_prop_fn_init`], but returns a [`DynInitProperty`].
-    pub fn new_prop_dyn_fn_init<'a, P>(
-        &'a self,
-        init_fn: impl 'a + Sync + Fn(&Extended<T>) -> P,
-    ) -> DynInitProperty<'a, T, P> {
-        self.new_prop(Box::new(FnInit { init_fn }))
-    }
-
     fn pin_layout(&self) -> Layout {
         let guard = self.layout.lock().unwrap();
         unsafe {
@@ -270,7 +246,8 @@ pub type ConstInitProperty<'a, T, P> = Property<'a, T, P, ConstInit<P>>;
 /// A shortcut for a [`Property`] that is initialized by a [`FnInit`].
 pub type FnInitProperty<'a, T, P, F> = Property<'a, T, P, FnInit<F>>;
 
-/// A shortcut for a [`Property`] that is initialized by a [`DynInit`].
+/// A shortcut for a [`Property`] that is initialized by a [`DynInit`]. Any property can be
+/// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
 pub type DynInitProperty<'a, T, P> = Property<'a, T, P, DynInit<'a, T, P>>;
 
 impl<'a, T, P, I: Init<T, P>> Property<'a, T, P, I> {
@@ -278,6 +255,25 @@ impl<'a, T, P, I: Init<T, P>> Property<'a, T, P, I> {
     /// [`Extended`]s contain this property.
     pub fn subject(&self) -> &Subject<T> {
         self.subject
+    }
+}
+
+impl<'a, T, P, I: Init<T, P> + Sync> Property<'a, T, P, I> {
+    /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
+    /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
+    pub fn into_dyn_init(self) -> DynInitProperty<'a, T, P> {
+        // Need to use unsafe here because there is no other way to take initer
+        unsafe {
+            let result = Property {
+                subject: self.subject,
+                offset: self.offset,
+                init_bit_offset: self.init_bit_offset,
+                initer: Box::new(ptr::read(&self.initer)) as DynInit<'a, T, P>,
+                _phantom: PhantomData
+            };
+            mem::forget(self);
+            return result;
+        }
     }
 }
 
