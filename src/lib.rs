@@ -25,12 +25,13 @@
 //! assert_eq!(obj[&prop_d], 6);
 //! ```
 
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 use std::{mem, ptr, usize};
 
 /// Identifies a category of objects and a dynamic set of [`Property`]s that apply to those objects.
@@ -43,29 +44,37 @@ use std::{mem, ptr, usize};
 /// [`Dynamic`] are associated with it. This is enforced by a lifetime parameter on those types. In
 /// practice, subjects will usually be bound to the `'static` lifetime.
 pub struct Subject<T> {
-    layout: Mutex<SubjectLayout>,
+    id: usize,
+    info: Mutex<SubjectInfo>,
     _phantom: PhantomData<fn(T)>,
 }
 
-struct SubjectLayout {
-    size: usize,
-    align: usize,
-    init_words: Vec<InitWord>,
-    drop_props: Vec<DropProperty>,
+static NEXT_SUBJECT_ID: AtomicUsize = AtomicUsize::new(0);
+
+const MIN_CHUNK_BODY_SIZE: usize = 128;
+
+struct SubjectInfo {
+    next_chunk_id: usize,
+    open_chunks: Vec<Arc<Mutex<ChunkInfo>>>,
 }
 
-struct InitWord {
-    offset: usize,
-    in_use: usize,
+struct ChunkInfo {
+    id: usize,
+    layout: Layout,
+    in_use_init_bits: usize,
+    in_use_size: usize,
+    drop_props: Vec<DropPropertyInfo>,
 }
 
-struct DropProperty {
+struct DropPropertyInfo {
     offset: usize,
     init_bit_offset: usize,
     drop: unsafe fn(NonNull<u8>),
 }
 
 struct PropertyInfo {
+    chunk_id: usize,
+    chunk: Arc<Mutex<ChunkInfo>>,
     offset: usize,
     init_bit_offset: usize,
 }
@@ -74,11 +83,10 @@ impl<T> Subject<T> {
     /// Creates a new subject.
     pub fn new() -> Self {
         Subject {
-            layout: Mutex::new(SubjectLayout {
-                size: 0,
-                align: 1,
-                init_words: Vec::new(),
-                drop_props: Vec::new(),
+            id: NEXT_SUBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            info: Mutex::new(SubjectInfo {
+                next_chunk_id: 0,
+                open_chunks: Vec::new(),
             }),
             _phantom: PhantomData,
         }
@@ -86,10 +94,12 @@ impl<T> Subject<T> {
 
     /// Creates a new property within this subject. An [`Init`] must be supplied to specify how the
     /// initial value of the property is determined.
-    pub fn new_prop<'a, P, I: Init<T, P>>(&'a self, initer: I) -> Property<'a, T, P, I> {
+    pub fn new_prop<P, I: Init<T, P>>(&self, initer: I) -> Property<T, P, I> {
         let info = self.alloc_prop::<P>();
         return Property {
-            subject: self,
+            subject_id: self.id,
+            chunk_id: info.chunk_id,
+            chunk: info.chunk,
             offset: info.offset,
             init_bit_offset: info.init_bit_offset,
             initer,
@@ -99,13 +109,13 @@ impl<T> Subject<T> {
 
     /// Creates a new property within this subject. Upon initialization, the property will have the
     /// default value (as defined by [`Default::default()`]) for type `P`.
-    pub fn new_prop_default_init<'a, P: Default>(&'a self) -> DefaultInitProperty<'a, T, P> {
+    pub fn new_prop_default_init<P: Default>(&self) -> DefaultInitProperty<T, P> {
         self.new_prop(DefaultInit)
     }
 
     /// Creates a new property within this subject. Upon initialization, the property will have the
     /// given value.
-    pub fn new_prop_const_init<'a, P: Clone>(&'a self, value: P) -> ConstInitProperty<'a, T, P> {
+    pub fn new_prop_const_init<P: Clone>(&self, value: P) -> ConstInitProperty<T, P> {
         self.new_prop(ConstInit { value })
     }
 
@@ -128,158 +138,133 @@ impl<T> Subject<T> {
     /// ```
     /// The constraints on property lifetimes ensure that circular references between property
     /// initializers are impossible.
-    pub fn new_prop_fn_init<'a, P, F: Fn(&Extended<T>) -> P>(
-        &'a self,
+    pub fn new_prop_fn_init<P, F: Fn(&Extended<T>) -> P>(
+        &self,
         init_fn: F,
-    ) -> FnInitProperty<'a, T, P, F> {
+    ) -> FnInitProperty<T, P, F> {
         self.new_prop(FnInit { init_fn })
     }
 
-    fn pin_layout(&self) -> Layout {
-        let guard = self.layout.lock().unwrap();
-        unsafe {
-            return Layout::from_size_align_unchecked(guard.size, guard.align);
-        }
-    }
-
     fn alloc_prop<P>(&self) -> PropertyInfo {
-        let mut layout = self.layout.lock().unwrap();
-        return layout.alloc_prop::<P>();
-    }
-
-    fn free_prop<P>(&self, offset: usize) {
-        if !mem::needs_drop::<P>() {
-            let mut layout = self.layout.lock().unwrap();
-            return layout.free_nodrop_prop(offset);
-        }
+        let mut info = self.info.lock().unwrap();
+        return info.alloc_prop::<P>();
     }
 }
 
-impl SubjectLayout {
+impl SubjectInfo {
     fn alloc_prop<P>(&mut self) -> PropertyInfo {
-        let init_bit_offset = self.alloc_init_bit();
-        let offset = self.alloc::<P>();
-        if mem::needs_drop::<P>() {
-            let drop = Self::drop_option_in_place::<P>;
-            self.drop_props.push(DropProperty {
-                offset,
-                init_bit_offset,
-                drop,
-            });
-        }
-        return PropertyInfo {
-            offset,
-            init_bit_offset,
-        };
-    }
-
-    unsafe fn drop_option_in_place<P>(ptr: NonNull<u8>) {
-        ptr::drop_in_place(ptr.cast::<Option<P>>().as_ptr());
-    }
-
-    fn alloc_init_bit(&mut self) -> usize {
-        // Search for an existing word that we can allocate a bit in
-        for init_word in self.init_words.iter_mut() {
-            if init_word.in_use != usize::MAX {
-                let bit = init_word.in_use.trailing_ones() as usize;
-                init_word.in_use |= 1 << bit;
-                return init_word.offset * 8 + bit;
+        // Check for a suitable open chunk to add the property to
+        // TODO: Remove unusable open chunks
+        for chunk in self.open_chunks.iter() {
+            let mut chunk_value = chunk.lock().unwrap();
+            if let Some(prop_info) = chunk_value.try_alloc_prop::<P>() {
+                return prop_info(chunk.clone());
             }
         }
 
-        // Allocate a new word
-        let offset = self.alloc::<usize>();
-        let mut in_use = 0;
-        let bit = 0;
-        in_use |= 1 << bit;
-        self.init_words.push(InitWord { offset, in_use });
-        return offset * 8 + bit;
+        // Define a new chunk
+        let layout = Layout::from_size_align(
+            max(MIN_CHUNK_BODY_SIZE, mem::size_of::<P>()),
+            max(mem::align_of::<usize>(), mem::align_of::<P>()),
+        )
+        .unwrap();
+        let mut chunk = ChunkInfo::new(self.next_chunk_id, layout);
+        self.next_chunk_id += 1;
+
+        // Allocate property in chunk
+        let prop_info = chunk.try_alloc_prop::<P>().unwrap();
+        let chunk = Arc::new(Mutex::new(chunk));
+        self.open_chunks.push(chunk.clone());
+        return prop_info(chunk);
+    }
+}
+
+impl ChunkInfo {
+    fn new(id: usize, layout: Layout) -> Self {
+        ChunkInfo {
+            id,
+            layout,
+            in_use_init_bits: 0,
+            in_use_size: 0,
+            drop_props: Vec::new(),
+        }
     }
 
-    fn alloc<P>(&mut self) -> usize {
-        self.alloc_raw(mem::size_of::<P>(), mem::align_of::<P>())
+    fn try_alloc_prop<P>(&mut self) -> Option<impl Fn(Arc<Mutex<ChunkInfo>>) -> PropertyInfo> {
+        let size = mem::size_of::<P>();
+        let align = mem::align_of::<P>();
+        if align <= self.layout.align() && self.in_use_init_bits != usize::MAX {
+            let offset = (self.in_use_size + align - 1) & !(align - 1);
+            let new_size = offset + size;
+            if new_size <= self.layout.size() {
+                self.in_use_size = new_size;
+                let init_bit_offset = self.in_use_init_bits.trailing_ones() as usize;
+                self.in_use_init_bits |= 1 << init_bit_offset;
+                if mem::needs_drop::<P>() {
+                    self.drop_props.push(DropPropertyInfo {
+                        offset,
+                        init_bit_offset,
+                        drop: Self::drop_in_place::<P>,
+                    });
+                }
+                let chunk_id = self.id;
+                return Some(move |chunk| PropertyInfo {
+                    chunk_id,
+                    chunk,
+                    offset,
+                    init_bit_offset,
+                });
+            }
+        }
+        return None;
     }
 
-    fn alloc_raw(&mut self, size: usize, align: usize) -> usize {
-        let offset = (self.size + align - 1) & !(align - 1);
-        self.size = offset + size;
-        self.align = max(self.align, align);
-        return offset;
-    }
-
-    fn free_nodrop_prop(&mut self, _offset: usize) {
-        // TODO: remove from layout
+    unsafe fn drop_in_place<P>(ptr: NonNull<u8>) {
+        ptr::drop_in_place(ptr.cast::<P>().as_ptr());
     }
 }
 
 /// Identifies a property that is present on objects of the appropriate [`Subject`].
-///
-/// ## Property Lifetime
-/// The lifetime of a reference to a property on an object is limited by both the object and
-/// the property itself. This allows memory to be reclaimed/reused for properties that have been
-/// dropped.
-///
-/// ```compile_fail
-/// use dynprops::{Subject, Dynamic};
-///
-/// let subject = Subject::new();
-/// let prop = subject.new_prop_const_init(5);
-/// let mut obj = Dynamic::new(&subject);
-/// let x = &mut obj[&prop];
-/// drop(prop);
-/// *x = 10; // ERROR: This reference requires prop to be alive
-/// ```
-pub struct Property<'a, T, P, I: 'a + Init<T, P>> {
-    subject: &'a Subject<T>,
+pub struct Property<T, P, I: Init<T, P>> {
+    subject_id: usize,
+    chunk_id: usize,
+    chunk: Arc<Mutex<ChunkInfo>>,
     offset: usize,
     init_bit_offset: usize,
     initer: I,
-    _phantom: PhantomData<fn() -> P>,
+    _phantom: PhantomData<fn(T) -> P>,
 }
 
 /// A shortcut for a [`Property`] that is initialized by a [`DefaultInit`].
-pub type DefaultInitProperty<'a, T, P> = Property<'a, T, P, DefaultInit>;
+pub type DefaultInitProperty<T, P> = Property<T, P, DefaultInit>;
 
 /// A shortcut for a [`Property`] that is initialized by a [`ConstInit`].
-pub type ConstInitProperty<'a, T, P> = Property<'a, T, P, ConstInit<P>>;
+pub type ConstInitProperty<T, P> = Property<T, P, ConstInit<P>>;
 
 /// A shortcut for a [`Property`] that is initialized by a [`FnInit`].
-pub type FnInitProperty<'a, T, P, F> = Property<'a, T, P, FnInit<F>>;
+pub type FnInitProperty<T, P, F> = Property<T, P, FnInit<F>>;
 
 /// A shortcut for a [`Property`] that is initialized by a [`DynInit`]. Any property can be
 /// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
-pub type DynInitProperty<'a, T, P> = Property<'a, T, P, DynInit<'a, T, P>>;
+pub type DynInitProperty<T, P> = Property<T, P, DynInit<T, P>>;
 
-impl<'a, T, P, I: Init<T, P>> Property<'a, T, P, I> {
-    /// Gets the [`Subject`] this property is associated with. This defines which [`Dynamic`]s and
-    /// [`Extended`]s contain this property.
-    pub fn subject(&self) -> &Subject<T> {
-        self.subject
-    }
-}
-
-impl<'a, T, P, I: Init<T, P> + Sync> Property<'a, T, P, I> {
+impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
     /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
     /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
-    pub fn into_dyn_init(self) -> DynInitProperty<'a, T, P> {
-        // Need to use unsafe here because there is no other way to take initer
+    pub fn into_dyn_init(mut self) -> DynInitProperty<T, P> {
         unsafe {
             let result = Property {
-                subject: self.subject,
+                subject_id: self.subject_id,
+                chunk_id: self.chunk_id,
+                chunk: ptr::read(&self.chunk),
                 offset: self.offset,
                 init_bit_offset: self.init_bit_offset,
-                initer: Box::new(ptr::read(&self.initer)) as DynInit<'a, T, P>,
-                _phantom: PhantomData
+                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<T, P>,
+                _phantom: PhantomData,
             };
             mem::forget(self);
             return result;
         }
-    }
-}
-
-impl<'a, T, P, I: Init<T, P>> Drop for Property<'a, T, P, I> {
-    fn drop(&mut self) {
-        self.subject.free_prop::<P>(self.offset);
     }
 }
 
@@ -303,7 +288,7 @@ pub struct FnInit<F> {
 }
 
 /// An [`Init`] that uses dynamic dispatch to defer to another [`Init`] at runtime.
-pub type DynInit<'a, T, P> = Box<dyn 'a + Sync + Init<T, P>>;
+pub type DynInit<T, P> = Box<dyn Sync + Init<T, P>>;
 
 impl<T, P, F: Fn(&Extended<T>) -> P> Init<T, P> for FnInit<F> {
     fn init(&self, obj: &Extended<T>) -> P {
@@ -323,7 +308,7 @@ impl<T, P: Default> Init<T, P> for DefaultInit {
     }
 }
 
-impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
+impl<T, P> Init<T, P> for DynInit<T, P> {
     fn init(&self, obj: &Extended<T>) -> P {
         self.as_ref().init(obj)
     }
@@ -351,10 +336,10 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
 /// obj.value = 15;
 /// assert_eq!(obj.value, 15);
 /// ```
-pub struct Extended<'a, T> {
+pub struct Extended<T> {
     pub value: T,
-    subject: &'a Subject<T>,
-    data: Mutex<ExtendedData>,
+    subject_id: usize,
+    chunks: Mutex<Vec<Chunk>>,
 }
 
 /// An object consisting entirely of dynamic properties defined in a particular [`Subject`].
@@ -368,239 +353,195 @@ pub struct Extended<'a, T> {
 /// obj[&prop] = "Bar";
 /// assert_eq!(obj[&prop], "Bar");
 /// ```
-pub type Dynamic<'a> = Extended<'a, ()>;
+pub type Dynamic = Extended<()>;
 
-impl<'a, T> Extended<'a, T> {
+impl<T> Extended<T> {
     /// Creates an [`Extended`] wrapper over the given value. This extends it with all of the
     /// [`Property`]s defined on `subject`.
-    pub fn new_extend(value: T, subject: &'a Subject<T>) -> Self {
+    pub fn new_extend(value: T, subject: &Subject<T>) -> Self {
         Extended {
             value,
-            subject,
-            data: Mutex::new(ExtendedData::new(subject.pin_layout())),
+            subject_id: subject.id,
+            chunks: Mutex::new(Vec::new()),
         }
     }
 
-    /// Gets the [`Subject`] this object is associated with. This defines which [`Property`]s are
-    /// available on the object.
-    pub fn subject(&self) -> &Subject<T> {
-        self.subject
-    }
+    fn index_raw<P, I: Init<T, P>>(&self, index: &Property<T, P, I>) -> NonNull<P> {
 
-    fn index_raw<P, I: Init<T, P>>(&self, index: &Property<'a, T, P, I>) -> NonNull<P> {
         // Verify subject
-        if (self.subject as *const Subject<T>) != (index.subject as *const Subject<T>) {
+        if self.subject_id != index.subject_id {
             panic!("Subject mismatch");
         }
 
-        // Check for initialization
-        let get_data_layout = || self.subject.pin_layout();
-        let init_word_offset = (index.init_bit_offset / 8) & !(mem::align_of::<usize>() - 1);
-        let init_word_bit = index.init_bit_offset - (init_word_offset * 8);
-        unsafe {
-            let mut data = self.data.lock().unwrap();
-            let init_word = data
-                .get_ptr(get_data_layout, init_word_offset)
-                .cast::<usize>()
-                .as_mut();
-            let value_ptr = data.get_ptr(get_data_layout, index.offset).cast::<P>();
-
-            // Drop the lock as soon as we have the pointers we need. We don't want to hold the
-            // lock during initialization, since other properties within the same object can
-            // be referenced.
-            drop(data);
-
-            let init_bit = (*init_word & (1 << init_word_bit)) != 0;
-            if !init_bit {
-                // Do initialization
-                let init_value = index.initer.init(&self);
-
-                // Lock to write the initial value
-                let data = self.data.lock().unwrap();
-                let init_bit = (*init_word & (1 << init_word_bit)) != 0;
-                if !init_bit {
-                    ptr::write(value_ptr.as_ptr(), init_value);
-                    *init_word |= 1 << init_word_bit;
+        // Binary search for pre-existing chunk
+        let mut chunks = self.chunks.lock().unwrap();
+        if chunks.len() > 0 {
+            let mut lo = 0;
+            let mut hi = chunks.len();
+            loop {
+                if !(lo < hi) {
+                    break;
                 }
-                drop(data);
+                let mid = (lo + hi) / 2;
+                let mid_chunk = &mut chunks[mid];
+                if index.chunk_id < mid_chunk.id {
+                    hi = mid;
+                } else if index.chunk_id > mid_chunk.id {
+                    lo = mid + 1;
+                } else {
+                    unsafe {
+                        let ptr = mid_chunk.try_index::<P>(index.offset, index.init_bit_offset);
+                        if let Some(ptr) = ptr {
+                            return NonNull::new_unchecked(ptr);
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
-            return value_ptr;
         }
+
+        // Initialize value (make sure not to hold lock due to the potential for recursive access)
+        // TODO: Prevent simultaneous initializations of same value
+        drop(chunks);
+        let init_value = index.initer.init(&self);
+
+        // Re-attempt index with initial value
+        unsafe {
+            return self.index_raw_with_init_unchecked(index, init_value);
+        }
+    }
+
+    unsafe fn index_raw_with_init_unchecked<P, I: Init<T, P>>(
+        &self,
+        index: &Property<T, P, I>,
+        init_value: P,
+    ) -> NonNull<P> {
+        // Binary search for pre-existing chunk
+        let mut chunks = self.chunks.lock().unwrap();
+        let mut lo = 0;
+        if chunks.len() > 0 {
+            let mut hi = chunks.len() - 1;
+            loop {
+                if !(lo < hi) {
+                    break;
+                }
+                let mid = (lo + hi) / 2;
+                let mid_chunk = &mut chunks[mid];
+                if index.chunk_id < mid_chunk.id {
+                    hi = mid;
+                } else if index.chunk_id > mid_chunk.id {
+                    lo = mid + 1;
+                } else {
+                    let ptr = mid_chunk.index_with_init(
+                        index.offset,
+                        index.init_bit_offset,
+                        init_value,
+                    );
+                    return NonNull::new_unchecked(ptr);
+                }
+            }
+        }
+
+        // Initialize chunk
+        let mut chunk = Chunk::new(&index.chunk);
+        let result = chunk.index_with_init(index.offset, index.init_bit_offset, init_value);
+        let result = NonNull::new_unchecked(result);
+        chunks.insert(lo, chunk);
+        return result;
     }
 }
 
-impl<'a> Dynamic<'a> {
+impl Dynamic {
     /// Creates a new [`Dynamic`] object.
-    pub fn new(subject: &'a Subject<()>) -> Self {
+    pub fn new(subject: &Subject<()>) -> Self {
         Self::new_extend((), subject)
     }
 }
 
-impl<'a, 'b, T, P, I: Init<T, P>> Index<&'b Property<'a, T, P, I>> for Extended<'b, T> {
+impl<T, P, I: Init<T, P>> Index<&Property<T, P, I>> for Extended<T> {
     type Output = P;
 
-    fn index(&self, index: &Property<'a, T, P, I>) -> &Self::Output {
+    fn index(&self, index: &Property<T, P, I>) -> &Self::Output {
         unsafe {
             return &(*self.index_raw(index).as_ref());
         }
     }
 }
 
-impl<'a, 'b, T, P, I: Init<T, P>> IndexMut<&'b Property<'a, T, P, I>> for Extended<'b, T> {
-    fn index_mut(&mut self, index: &Property<'a, T, P, I>) -> &mut Self::Output {
+impl<T, P, I: Init<T, P>> IndexMut<&Property<T, P, I>> for Extended<T> {
+    fn index_mut(&mut self, index: &Property<T, P, I>) -> &mut Self::Output {
         unsafe {
             return &mut (*self.index_raw(index).as_mut());
         }
     }
 }
 
-impl<'a, T> Drop for Extended<'a, T> {
-    fn drop(&mut self) {
-        let mut data = self.data.lock().unwrap();
-        let layout = self.subject.layout.lock().unwrap();
-        for prop in layout.drop_props.iter() {
-            let get_data_layout = || self.subject.pin_layout();
-            let init_word_offset = (prop.init_bit_offset / 8) & !(mem::align_of::<usize>() - 1);
-            let init_word_bit = prop.init_bit_offset - (init_word_offset * 8);
-            unsafe {
-                let init_word = data
-                    .get_ptr(get_data_layout, init_word_offset)
-                    .cast::<usize>()
-                    .as_mut();
-                let init_bit = (*init_word & (1 << init_word_bit)) != 0;
-                if init_bit {
-                    // Drop property
-                    let value_ptr = data.get_ptr(get_data_layout, prop.offset);
-                    (prop.drop)(value_ptr);
-                }
-            }
-        }
-    }
-}
-
-/// The internal representation of the data for a [Extended]. Note that, unlike [Vec], we can't move
-/// underlying data when new properties are added. That's because properties can be initialized
-/// from a shared borrow at the same time that pre-existing properties are being referenced. This
-/// limits are design choices here considerably. The current implementation stores data in either
-/// a "head" chunk or an "overflow" chunk. The "head" chunk consists of the properties that
-/// existed when the [Extended] was created, and the "overflow" chunks contain blocks of new
-/// properties that were added later on.
-struct ExtendedData {
-    head_chunk: Chunk,
-    overflow_chunks: Vec<Chunk>,
-}
-
-/// Describes a chunk within [ExtendedData].
+/// Describes a chunk within an [`Extended`].
 struct Chunk {
+    id: usize,
+    info: Arc<Mutex<ChunkInfo>>,
+    init_word: usize,
     ptr: NonNull<u8>,
-    layout: Layout,
-    data_end: usize,
-}
-
-impl ExtendedData {
-    fn new(head_layout: Layout) -> Self {
-        ExtendedData {
-            head_chunk: Chunk::new(head_layout, head_layout.size()),
-            overflow_chunks: Vec::new(),
-        }
-    }
-
-    /// Gets a pointer to a particular property within the [ExtendedData], given the offset of the
-    /// property within the entire [SubjectLayout]. If an additional chunk needs to be allocated,
-    /// `get_data_layout` will be used to get the latest size/alignment of the [SubjectLayout].
-    fn get_ptr(&mut self, get_data_layout: impl FnOnce() -> Layout, offset: usize) -> NonNull<u8> {
-        // Is the data in the head chunk?
-        if offset < self.head_chunk.data_end {
-            unsafe {
-                return NonNull::new_unchecked(self.head_chunk.ptr.as_ptr().add(offset));
-            }
-        }
-
-        // Is the data in an existing overflow chunk?
-        let mut overflow_data_end = self.head_chunk.data_end;
-        match self.overflow_chunks.last() {
-            Some(last_overflow_chunk) => {
-                overflow_data_end = last_overflow_chunk.data_end;
-                if offset < last_overflow_chunk.data_end {
-                    // Use binary search to figure out which chunk
-                    let mut lo_chunk_index = 0;
-                    let mut hi_chunk_index = self.overflow_chunks.len() - 1;
-                    let mut chunk_data_start = self.head_chunk.data_end;
-                    loop {
-                        if !(lo_chunk_index < hi_chunk_index) {
-                            break;
-                        }
-                        let mid_chunk_index = (lo_chunk_index + hi_chunk_index) / 2;
-                        let mid_chunk = &self.overflow_chunks[mid_chunk_index];
-                        if offset < mid_chunk.data_end {
-                            hi_chunk_index = mid_chunk_index;
-                        } else {
-                            chunk_data_start = mid_chunk.data_end;
-                            lo_chunk_index = mid_chunk_index + 1;
-                        }
-                    }
-                    unsafe {
-                        let overflow_chunk = &self.overflow_chunks[lo_chunk_index];
-                        return NonNull::new_unchecked(
-                            overflow_chunk
-                                .ptr
-                                .as_ptr()
-                                .sub(chunk_data_start)
-                                .add(offset),
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Create a new overflow chunk
-        let data_layout = get_data_layout();
-        let new_data_end = data_layout.size();
-        assert!(offset < new_data_end);
-        let chunk_layout =
-            Layout::from_size_align(new_data_end - overflow_data_end, data_layout.align()).unwrap();
-        let overflow_chunk = Chunk::new(chunk_layout, new_data_end);
-        let result = unsafe {
-            NonNull::new_unchecked(
-                overflow_chunk
-                    .ptr
-                    .as_ptr()
-                    .sub(overflow_data_end)
-                    .add(offset),
-            )
-        };
-        self.overflow_chunks.push(overflow_chunk);
-        return result;
-    }
 }
 
 impl Chunk {
-    fn new(layout: Layout, data_end: usize) -> Self {
-        let ptr = if layout.size() > 0 {
-            unsafe {
-                match NonNull::new(alloc_zeroed(layout)) {
-                    Some(ptr) => ptr,
-                    None => handle_alloc_error(layout),
-                }
+    fn new(info: &Arc<Mutex<ChunkInfo>>) -> Self {
+        let info_value = info.lock().unwrap();
+        unsafe {
+            match NonNull::new(alloc(info_value.layout)) {
+                Some(ptr) => Chunk {
+                    id: info_value.id,
+                    info: info.clone(),
+                    init_word: 0,
+                    ptr,
+                },
+                None => handle_alloc_error(info_value.layout),
             }
-        } else {
-            NonNull::dangling()
-        };
-        Chunk {
-            ptr,
-            layout,
-            data_end,
         }
+    }
+
+    /// Attempts to get a reference to a pre-initialized property in this chunk, returning
+    /// [`None`] if the the property has not been initialized yet.
+    unsafe fn try_index<P>(&mut self, offset: usize, init_bit_offset: usize) -> Option<&mut P> {
+        let mut ptr = NonNull::new_unchecked(self.ptr.as_ptr().add(offset)).cast::<P>();
+        if (self.init_word & (1 << init_bit_offset)) > 0 {
+            return Some(ptr.as_mut());
+        } else {
+            return None;
+        }
+    }
+
+    /// Attempts to get a reference to a property in this chunk, using [`init_value`] to initialize
+    /// it if it isn't initialized yet.
+    unsafe fn index_with_init<P>(
+        &mut self,
+        offset: usize,
+        init_bit_offset: usize,
+        init_value: P,
+    ) -> &mut P {
+        let mut ptr = NonNull::new_unchecked(self.ptr.as_ptr().add(offset)).cast::<P>();
+        if (self.init_word & (1 << init_bit_offset)) == 0 {
+            self.init_word |= 1 << init_bit_offset;
+            ptr::write(ptr.as_ptr(), init_value);
+        }
+        return ptr.as_mut();
     }
 }
 
 impl Drop for Chunk {
     fn drop(&mut self) {
-        if self.layout.size() > 0 {
-            unsafe {
-                dealloc(self.ptr.as_ptr(), self.layout);
+        let info = self.info.lock().unwrap();
+        for drop_prop in info.drop_props.iter() {
+            if (self.init_word & (1 << drop_prop.init_bit_offset)) > 0 {
+                unsafe {
+                    let ptr = self.ptr.as_ptr().add(drop_prop.offset);
+                    (drop_prop.drop)(NonNull::new_unchecked(ptr));
+                }
             }
+        }
+        unsafe {
+            dealloc(self.ptr.as_ptr(), info.layout);
         }
     }
 }
