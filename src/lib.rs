@@ -38,11 +38,6 @@ use std::{mem, ptr, usize};
 /// New properties can be introduced into the subject at any time using [`Subject::new_prop`]
 /// and its derivatives. When accessing a property of an object, the subject of the property
 /// must match the subject of the object.
-///
-/// ## Lifetime
-/// The [`Subject`] must be alive for the entire duration that any [`Property`], [`Extended`] or
-/// [`Dynamic`] are associated with it. This is enforced by a lifetime parameter on those types. In
-/// practice, subjects will usually be bound to the `'static` lifetime.
 pub struct Subject<T> {
     id: usize,
     info: Mutex<SubjectInfo>,
@@ -246,12 +241,12 @@ pub type FnInitProperty<T, P, F> = Property<T, P, FnInit<F>>;
 
 /// A shortcut for a [`Property`] that is initialized by a [`DynInit`]. Any property can be
 /// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
-pub type DynInitProperty<T, P> = Property<T, P, DynInit<T, P>>;
+pub type DynInitProperty<'a, T, P> = Property<T, P, DynInit<'a, T, P>>;
 
-impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
+impl<'a, T, P, I: 'a + Init<T, P> + Sync> Property<T, P, I> {
     /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
     /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
-    pub fn into_dyn_init(mut self) -> DynInitProperty<T, P> {
+    pub fn into_dyn_init(mut self) -> DynInitProperty<'a, T, P> {
         unsafe {
             let result = Property {
                 subject_id: self.subject_id,
@@ -259,7 +254,7 @@ impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
                 chunk: ptr::read(&self.chunk),
                 offset: self.offset,
                 init_bit_offset: self.init_bit_offset,
-                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<T, P>,
+                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<'a, T, P>,
                 _phantom: PhantomData,
             };
             mem::forget(self);
@@ -288,7 +283,7 @@ pub struct FnInit<F> {
 }
 
 /// An [`Init`] that uses dynamic dispatch to defer to another [`Init`] at runtime.
-pub type DynInit<T, P> = Box<dyn Sync + Init<T, P>>;
+pub type DynInit<'a, T, P> = Box<dyn 'a + Sync + Init<T, P>>;
 
 impl<T, P, F: Fn(&Extended<T>) -> P> Init<T, P> for FnInit<F> {
     fn init(&self, obj: &Extended<T>) -> P {
@@ -308,7 +303,7 @@ impl<T, P: Default> Init<T, P> for DefaultInit {
     }
 }
 
-impl<T, P> Init<T, P> for DynInit<T, P> {
+impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
     fn init(&self, obj: &Extended<T>) -> P {
         self.as_ref().init(obj)
     }
