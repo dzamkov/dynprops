@@ -9,26 +9,25 @@
 //! let prop_a = subject.new_prop_const_init(5);
 //! let prop_b = subject.new_prop_const_init("Foo");
 //! let mut obj = Dynamic::new(&subject);
-//! assert_eq!(obj[&prop_a], 5);
-//! assert_eq!(obj[&prop_b], "Foo");
+//! assert_eq!(*obj.get(&prop_a), 5);
+//! assert_eq!(*obj.get(&prop_b), "Foo");
 //!
 //! // Properties can be changed on a mutable object
-//! obj[&prop_b] = "Foobar";
-//! assert_eq!(obj[&prop_b], "Foobar");
+//! obj.set(&prop_b, "Foobar");
+//! assert_eq!(*obj.get(&prop_b), "Foobar");
 //!
 //! // New properties can be introduced after an object is already created
 //! let prop_c = subject.new_prop_default_init::<u32>();
-//! assert_eq!(obj[&prop_c], 0u32);
+//! assert_eq!(*obj.get(&prop_c), 0u32);
 //!
 //! // Properties can be initialized based on a function of other properties on the object
-//! let prop_d = subject.new_prop_fn_init(|obj| obj[&prop_b].len());
-//! assert_eq!(obj[&prop_d], 6);
+//! let prop_d = subject.new_prop_fn_init(|obj| obj.get(&prop_b).len());
+//! assert_eq!(*obj.get(&prop_d), 6);
 //! ```
 
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
 use std::marker::PhantomData;
-use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -124,12 +123,12 @@ impl<T> Subject<T> {
     ///
     /// let subject = Subject::new();
     /// let prop_value = subject.new_prop_fn_init(|obj| obj.value);
-    /// let prop_double_value = subject.new_prop_fn_init(|obj| obj[&prop_value] * 2);
-    /// let prop_square_value = subject.new_prop_fn_init(|obj| obj[&prop_value] * obj[&prop_value]);
+    /// let prop_double_value = subject.new_prop_fn_init(|obj| obj.get(&prop_value) * 2);
+    /// let prop_square_value = subject.new_prop_fn_init(|obj| obj.get(&prop_value) * obj.get(&prop_value));
     /// let obj = Extended::new_extend(20, &subject);
-    /// assert_eq!(obj[&prop_value], 20);
-    /// assert_eq!(obj[&prop_double_value], 40);
-    /// assert_eq!(obj[&prop_square_value], 400);
+    /// assert_eq!(*obj.get(&prop_value), 20);
+    /// assert_eq!(*obj.get(&prop_double_value), 40);
+    /// assert_eq!(*obj.get(&prop_square_value), 400);
     /// ```
     /// The constraints on property lifetimes ensure that circular references between property
     /// initializers are impossible.
@@ -311,15 +310,17 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
 
 /// Extends a value of type `T` with properties defined in a particular [`Subject<T>`].
 ///
-/// Property values are accessed by index, like so:
+/// Property values are accessed using `get`, `get_mut` and `set`, like so:
 /// ```
 /// use dynprops::{Subject, Extended};
 ///
 /// let subject = Subject::new();
 /// let prop = subject.new_prop_default_init();
 /// let mut obj = Extended::new_extend(5, &subject);
-/// obj[&prop] = "Foo";
-/// assert_eq!(obj[&prop], "Foo");
+/// obj.set(&prop, "Foo");
+/// assert_eq!(*obj.get(&prop), "Foo");
+/// *obj.get_mut(&prop) = "Bar";
+/// assert_eq!(*obj.get(&prop), "Bar");
 /// ```
 ///
 /// The base value of an [`Extended`] object can always be accessed through the `value` field:
@@ -339,14 +340,17 @@ pub struct Extended<T> {
 
 /// An object consisting entirely of dynamic properties defined in a particular [`Subject`].
 ///
-/// Property values are accessed by index, like so:
+/// Property values are accessed using `get`, `get_mut` and `set`, like so:
 /// ```
 /// use dynprops::{Subject, Dynamic};
+///
 /// let subject = Subject::new();
 /// let prop = subject.new_prop_default_init();
 /// let mut obj = Dynamic::new(&subject);
-/// obj[&prop] = "Bar";
-/// assert_eq!(obj[&prop], "Bar");
+/// obj.set(&prop, "Foo");
+/// assert_eq!(*obj.get(&prop), "Foo");
+/// *obj.get_mut(&prop) = "Bar";
+/// assert_eq!(*obj.get(&prop), "Bar");
 /// ```
 pub type Dynamic = Extended<()>;
 
@@ -361,39 +365,23 @@ impl<T> Extended<T> {
         }
     }
 
-    fn index_raw<P, I: Init<T, P>>(&self, index: &Property<T, P, I>) -> NonNull<P> {
+    /// Gets a dynamic property in this [`Extended`], initializing it if needed.
+    pub fn get<'a, P, I: Init<T, P>>(&'a self, index: &'a Property<T, P, I>) -> &'a P {
+        self.assert_subject(index.subject_id);
 
-        // Verify subject
-        if self.subject_id != index.subject_id {
-            panic!("Subject mismatch");
-        }
-
-        // Binary search for pre-existing chunk
+        // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();
-        if chunks.len() > 0 {
-            let mut lo = 0;
-            let mut hi = chunks.len();
-            loop {
-                if !(lo < hi) {
-                    break;
+        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
+            Ok(chunk) => unsafe {
+                if let Some(res) = chunk.try_get_mut::<P>(index.offset, index.init_bit_offset) {
+                    // Extending lifetime here because we need to drop the lock while returning
+                    // a reference to something behind it. This is okay because the contents of the
+                    // reference are initialized and can't change anymore (without a mutable
+                    // reference to the Extended).
+                    return mem::transmute(res);
                 }
-                let mid = (lo + hi) / 2;
-                let mid_chunk = &mut chunks[mid];
-                if index.chunk_id < mid_chunk.id {
-                    hi = mid;
-                } else if index.chunk_id > mid_chunk.id {
-                    lo = mid + 1;
-                } else {
-                    unsafe {
-                        let ptr = mid_chunk.try_index::<P>(index.offset, index.init_bit_offset);
-                        if let Some(ptr) = ptr {
-                            return NonNull::new_unchecked(ptr);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
+            },
+            Err(_) => {}
         }
 
         // Initialize value (make sure not to hold lock due to the potential for recursive access)
@@ -401,49 +389,112 @@ impl<T> Extended<T> {
         drop(chunks);
         let init_value = index.initer.init(&self);
 
-        // Re-attempt index with initial value
-        unsafe {
-            return self.index_raw_with_init_unchecked(index, init_value);
+        // Search for chunk again
+        let mut chunks = self.chunks.lock().unwrap();
+        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
+            Ok(chunk) => unsafe {
+                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                return mem::transmute(res);
+            },
+            Err(after) => unsafe {
+                // Initialize chunk
+                let chunk = Chunk::new(&index.chunk);
+                chunks.insert(after, chunk);
+                let chunk = &mut chunks[after];
+                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                return mem::transmute(res);
+            },
         }
     }
 
-    unsafe fn index_raw_with_init_unchecked<P, I: Init<T, P>>(
-        &self,
-        index: &Property<T, P, I>,
-        init_value: P,
-    ) -> NonNull<P> {
+    /// Gets a mutable reference to a dynamic property in this [`Extended`], initializing
+    /// it if needed.
+    pub fn get_mut<'a, P, I: Init<T, P>>(&'a mut self, index: &'a Property<T, P, I>) -> &'a mut P {
+        self.assert_subject(index.subject_id);
+
+        // Search for chunk
+        let chunks = self.chunks.get_mut().unwrap();
+        match Self::find_chunk_mut(chunks, index.chunk_id) {
+            Ok(chunk) => unsafe {
+                if let Some(res) = chunk.try_get_mut::<P>(index.offset, index.init_bit_offset) {
+                    return mem::transmute(res);
+                }
+            },
+            Err(_) => {}
+        }
+
+        // Initialize value
+        let init_value = index.initer.init(&self);
+
+        // Search for chunk again
+        let mut chunks = self.chunks.get_mut().unwrap();
+        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
+            Ok(chunk) => unsafe {
+                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                return mem::transmute(res);
+            },
+            Err(after) => unsafe {
+                // Initialize chunk
+                let chunk = Chunk::new(&index.chunk);
+                chunks.insert(after, chunk);
+                let chunk = &mut chunks[after];
+                return chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+            },
+        }
+    }
+
+    /// Sets the value of a dynamic property in this [`Extended`].
+    pub fn set<P, I: Init<T, P>>(&mut self, index: &Property<T, P, I>, value: P) {
+        self.assert_subject(index.subject_id);
+
+        // Search for chunk
+        let chunks = self.chunks.get_mut().unwrap();
+        match Self::find_chunk_mut(chunks, index.chunk_id) {
+            Ok(chunk) => unsafe {
+                chunk.set(index.offset, index.init_bit_offset, value);
+            },
+            Err(after) => unsafe {
+                // Initialize chunk
+                let mut chunk = Chunk::new(&index.chunk);
+                chunk.set(index.offset, index.init_bit_offset, value);
+                println!("New");
+                chunks.insert(after, chunk);
+            },
+        }
+    }
+
+    /// Asserts that this [`Extended`] is of the given subject.
+    fn assert_subject(&self, subject_id: usize) {
+        assert_eq!(self.subject_id, subject_id, "Subject mismatch");
+    }
+
+    /// Searches for the chunk with the given id within `chunks`. Returns a reference to the chunk
+    /// if found, or the index where the chunk would be if it existed.
+    fn find_chunk_mut(chunks: &mut Vec<Chunk>, chunk_id: usize) -> Result<&mut Chunk, usize> {
         // Binary search for pre-existing chunk
-        let mut chunks = self.chunks.lock().unwrap();
         let mut lo = 0;
         if chunks.len() > 0 {
-            let mut hi = chunks.len() - 1;
+            let mut hi = chunks.len();
             loop {
                 if !(lo < hi) {
                     break;
                 }
                 let mid = (lo + hi) / 2;
                 let mid_chunk = &mut chunks[mid];
-                if index.chunk_id < mid_chunk.id {
+                if chunk_id < mid_chunk.id {
                     hi = mid;
-                } else if index.chunk_id > mid_chunk.id {
+                } else if chunk_id > mid_chunk.id {
                     lo = mid + 1;
                 } else {
-                    let ptr = mid_chunk.index_with_init(
-                        index.offset,
-                        index.init_bit_offset,
-                        init_value,
-                    );
-                    return NonNull::new_unchecked(ptr);
+                    // Need unsafe here because of limitations of borrow checker
+                    // https://github.com/rust-lang/rust/issues/43234
+                    unsafe {
+                        return Ok(mem::transmute(mid_chunk));
+                    }
                 }
             }
         }
-
-        // Initialize chunk
-        let mut chunk = Chunk::new(&index.chunk);
-        let result = chunk.index_with_init(index.offset, index.init_bit_offset, init_value);
-        let result = NonNull::new_unchecked(result);
-        chunks.insert(lo, chunk);
-        return result;
+        return Err(lo);
     }
 }
 
@@ -451,24 +502,6 @@ impl Dynamic {
     /// Creates a new [`Dynamic`] object.
     pub fn new(subject: &Subject<()>) -> Self {
         Self::new_extend((), subject)
-    }
-}
-
-impl<T, P, I: Init<T, P>> Index<&Property<T, P, I>> for Extended<T> {
-    type Output = P;
-
-    fn index(&self, index: &Property<T, P, I>) -> &Self::Output {
-        unsafe {
-            return &(*self.index_raw(index).as_ref());
-        }
-    }
-}
-
-impl<T, P, I: Init<T, P>> IndexMut<&Property<T, P, I>> for Extended<T> {
-    fn index_mut(&mut self, index: &Property<T, P, I>) -> &mut Self::Output {
-        unsafe {
-            return &mut (*self.index_raw(index).as_mut());
-        }
     }
 }
 
@@ -498,7 +531,7 @@ impl Chunk {
 
     /// Attempts to get a reference to a pre-initialized property in this chunk, returning
     /// [`None`] if the the property has not been initialized yet.
-    unsafe fn try_index<P>(&mut self, offset: usize, init_bit_offset: usize) -> Option<&mut P> {
+    unsafe fn try_get_mut<P>(&mut self, offset: usize, init_bit_offset: usize) -> Option<&mut P> {
         let mut ptr = NonNull::new_unchecked(self.ptr.as_ptr().add(offset)).cast::<P>();
         if (self.init_word & (1 << init_bit_offset)) > 0 {
             return Some(ptr.as_mut());
@@ -509,7 +542,7 @@ impl Chunk {
 
     /// Attempts to get a reference to a property in this chunk, using [`init_value`] to initialize
     /// it if it isn't initialized yet.
-    unsafe fn index_with_init<P>(
+    unsafe fn get_mut_with_init<P>(
         &mut self,
         offset: usize,
         init_bit_offset: usize,
@@ -521,6 +554,17 @@ impl Chunk {
             ptr::write(ptr.as_ptr(), init_value);
         }
         return ptr.as_mut();
+    }
+
+    /// Sets the value of a property in this chunk.
+    unsafe fn set<P>(&mut self, offset: usize, init_bit_offset: usize, value: P) {
+        let mut ptr = NonNull::new_unchecked(self.ptr.as_ptr().add(offset)).cast::<P>();
+        if (self.init_word & (1 << init_bit_offset)) == 0 {
+            self.init_word |= 1 << init_bit_offset;
+            ptr::write(ptr.as_ptr(), value);
+        } else {
+            *ptr.as_mut() = value;
+        }
     }
 }
 

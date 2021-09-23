@@ -7,7 +7,7 @@ fn test_dyn_add() {
     let dynamic = Dynamic::new(&subject);
     for i in 0..100 {
         let prop = subject.new_prop_const_init(i);
-        assert_eq!(dynamic[&prop], i);
+        assert_eq!(*dynamic.get(&prop), i);
     }
 }
 
@@ -19,7 +19,7 @@ fn test_wrong_subject() {
     let _prop_a = subject_a.new_prop_const_init(1);
     let prop_b = subject_b.new_prop_const_init(2);
     let dynamic_a = Dynamic::new(&subject_a);
-    let _ = dynamic_a[&prop_b];
+    let _ = dynamic_a.get(&prop_b);
 }
 
 struct DropCounter<'a> {
@@ -61,12 +61,12 @@ fn test_drop() {
         let prop_a = subject.new_prop_const_init(DropCounter::new(&num_alive));
         let dynamic_a = Dynamic::new(&subject);
         let prop_b = subject.new_prop_const_init(DropCounter::new(&num_alive));
-        dynamic_a[&prop_a].touch();
-        dynamic_a[&prop_b].touch();
+        dynamic_a.get(&prop_a).touch();
+        dynamic_a.get(&prop_b).touch();
         let dynamic_b = Dynamic::new(&subject);
-        dynamic_b[&prop_b].touch();
+        dynamic_b.get(&prop_b).touch();
         drop(dynamic_a);
-        dynamic_b[&prop_a].touch();
+        dynamic_b.get(&prop_a).touch();
         drop(prop_b);
     }
     assert_eq!(num_alive.get(), 0);
