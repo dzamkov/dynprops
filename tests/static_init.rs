@@ -9,17 +9,17 @@ struct Context {
 static CONTEXT: Subject<Context> = Subject::new();
 
 #[dynamic]
-static DOUBLE: DynInitProperty<'static, Context, i32> = CONTEXT
+static DOUBLE: DynInitProperty<Context, i32> = CONTEXT
     .new_prop_fn_init(|context| context.value.param * 2)
     .into_dyn_init();
 
 #[dynamic]
-static SQUARE: DynInitProperty<'static, Context, i32> = CONTEXT
+static SQUARE: DynInitProperty<Context, i32> = CONTEXT
     .new_prop_fn_init(|context| context.value.param * context.value.param)
     .into_dyn_init();
 
 #[dynamic]
-static SQUARE_PLUS_DOUBLE: DynInitProperty<'static, Context, i32> = CONTEXT
+static SQUARE_PLUS_DOUBLE: DynInitProperty<Context, i32> = CONTEXT
     .new_prop_fn_init(|context| context.get(&SQUARE) + context.get(&DOUBLE))
     .into_dyn_init();
 

@@ -240,12 +240,12 @@ pub type FnInitProperty<T, P, F> = Property<T, P, FnInit<F>>;
 
 /// A shortcut for a [`Property`] that is initialized by a [`DynInit`]. Any property can be
 /// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
-pub type DynInitProperty<'a, T, P> = Property<T, P, DynInit<'a, T, P>>;
+pub type DynInitProperty<T, P> = Property<T, P, DynInit<'static, T, P>>;
 
-impl<'a, T, P, I: 'a + Init<T, P> + Sync> Property<T, P, I> {
+impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
     /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
     /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
-    pub fn into_dyn_init(mut self) -> DynInitProperty<'a, T, P> {
+    pub fn into_dyn_init(mut self) -> DynInitProperty<T, P> {
         unsafe {
             let result = Property {
                 subject_id: self.subject_id,
@@ -253,7 +253,7 @@ impl<'a, T, P, I: 'a + Init<T, P> + Sync> Property<T, P, I> {
                 chunk: ptr::read(&self.chunk),
                 offset: self.offset,
                 init_bit_offset: self.init_bit_offset,
-                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<'a, T, P>,
+                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<'static, T, P>,
                 _phantom: PhantomData,
             };
             mem::forget(self);
