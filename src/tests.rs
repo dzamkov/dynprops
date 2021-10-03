@@ -1,5 +1,5 @@
-use std::cell::Cell;
 use crate::*;
+use std::cell::Cell;
 
 #[test]
 fn test_new_prop() {
@@ -24,7 +24,7 @@ fn test_wrong_subject() {
 
 pub struct DropCounter {
     tracker: Arc<()>,
-    is_alive: Cell<bool>
+    is_alive: Cell<bool>,
 }
 
 impl DropCounter {

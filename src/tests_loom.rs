@@ -1,9 +1,9 @@
-use loom::thread;
-use loom::sync::atomic::AtomicUsize;
-use loom::sync::Arc;
-use loom::sync::atomic::Ordering;
-use std::cell::Cell;
 use crate::*;
+use loom::sync::atomic::AtomicUsize;
+use loom::sync::atomic::Ordering;
+use loom::sync::Arc;
+use loom::thread;
+use std::cell::Cell;
 
 #[test]
 fn test_concurrent_init() {
@@ -11,22 +11,17 @@ fn test_concurrent_init() {
         let subject = Arc::new(Subject::new());
         let dynamic = Arc::new(Dynamic::new(&subject));
         let counter = AtomicUsize::new(0);
-        let prop = Arc::new(subject.new_prop_fn_init(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst)
-        }));
+        let prop =
+            Arc::new(subject.new_prop_fn_init(move |_| counter.fetch_add(1, Ordering::SeqCst)));
         let handle_0 = {
             let dynamic = dynamic.clone();
             let prop = prop.clone();
-            thread::spawn(move || {
-                *dynamic.get(&prop)
-            })
+            thread::spawn(move || *dynamic.get(&prop))
         };
         let handle_1 = {
             let dynamic = dynamic.clone();
             let prop = prop.clone();
-            thread::spawn(move || {
-                *dynamic.get(&prop)
-            })
+            thread::spawn(move || *dynamic.get(&prop))
         };
         let counter_0 = handle_0.join().unwrap();
         let counter_1 = handle_1.join().unwrap();
@@ -37,7 +32,7 @@ fn test_concurrent_init() {
 
 pub struct DropCounter {
     tracker: Arc<()>,
-    is_alive: Cell<bool>
+    is_alive: Cell<bool>,
 }
 
 impl DropCounter {
