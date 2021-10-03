@@ -2,7 +2,7 @@ use std::cell::Cell;
 use crate::*;
 
 #[test]
-fn test_dyn_add() {
+fn test_new_prop() {
     let subject = Subject::new();
     let dynamic = Dynamic::new(&subject);
     for i in 0..100 {
@@ -22,45 +22,44 @@ fn test_wrong_subject() {
     let _ = dynamic_a.get(&prop_b);
 }
 
-struct DropCounter<'a> {
-    num_alive: &'a Cell<u32>,
+pub struct DropCounter {
+    tracker: Arc<()>,
     is_alive: Cell<bool>
 }
 
-impl<'a> DropCounter<'a> {
-    fn new(num_alive: &'a Cell<u32>) -> Self {
-        num_alive.set(num_alive.get() + 1);
+impl DropCounter {
+    pub fn new(tracker: Arc<()>) -> Self {
         let is_alive = Cell::new(true);
-        DropCounter { num_alive, is_alive }
+        DropCounter { tracker, is_alive }
     }
 
-    fn touch(&self) {
+    pub fn touch(&self) {
         assert!(self.is_alive.get());
     }
 }
 
-impl<'a> Clone for DropCounter<'a> {
+impl Clone for DropCounter {
     fn clone(&self) -> Self {
         assert!(self.is_alive.get());
-        DropCounter::new(self.num_alive)
+        DropCounter::new(self.tracker.clone())
     }
 }
 
-impl<'a> Drop for DropCounter<'a> {
+impl Drop for DropCounter {
     fn drop(&mut self) {
         assert!(self.is_alive.get());
-        self.num_alive.set(self.num_alive.get() - 1);
+        self.is_alive.set(false);
     }
 }
 
 #[test]
 fn test_drop() {
-    let num_alive = Cell::new(0);
+    let mut tracker = Arc::new(());
     {
         let subject = Subject::new();
-        let prop_a = subject.new_prop_const_init(DropCounter::new(&num_alive));
+        let prop_a = subject.new_prop_const_init(DropCounter::new(tracker.clone()));
         let dynamic_a = Dynamic::new(&subject);
-        let prop_b = subject.new_prop_const_init(DropCounter::new(&num_alive));
+        let prop_b = subject.new_prop_const_init(DropCounter::new(tracker.clone()));
         dynamic_a.get(&prop_a).touch();
         dynamic_a.get(&prop_b).touch();
         let dynamic_b = Dynamic::new(&subject);
@@ -69,5 +68,5 @@ fn test_drop() {
         dynamic_b.get(&prop_a).touch();
         drop(prop_b);
     }
-    assert_eq!(num_alive.get(), 0);
+    assert!(Arc::get_mut(&mut tracker).is_some());
 }

@@ -7,13 +7,13 @@
 //!
 //! let subject = Subject::new();
 //! let prop_a = subject.new_prop_const_init(5);
-//! let prop_b = subject.new_prop_const_init("Foo");
+//! let mut prop_b = subject.new_prop_const_init("Foo");
 //! let mut obj = Dynamic::new(&subject);
 //! assert_eq!(*obj.get(&prop_a), 5);
 //! assert_eq!(*obj.get(&prop_b), "Foo");
 //!
-//! // Properties can be changed on a mutable object
-//! obj.set(&prop_b, "Foobar");
+//! // Mutable properties can be changed on an object (even if the object is not mutable)
+//! obj.set(&mut prop_b, "Foobar");
 //! assert_eq!(*obj.get(&prop_b), "Foobar");
 //!
 //! // New properties can be introduced after an object is already created
@@ -24,14 +24,23 @@
 //! let prop_d = subject.new_prop_fn_init(|obj| obj.get(&prop_b).len());
 //! assert_eq!(*obj.get(&prop_d), 6);
 //! ```
-
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
 use std::{mem, ptr, usize};
+
+#[cfg(loom)]
+use loom::sync::atomic::AtomicUsize;
+
+#[cfg(loom)]
+use loom::sync::{Arc, Mutex};
+
+#[cfg(not(loom))]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(not(loom))]
+use std::sync::{Arc, Mutex};
 
 /// Identifies a category of objects and a dynamic set of [`Property`]s that apply to those objects.
 /// New properties can be introduced into the subject at any time using [`Subject::new_prop`]
@@ -43,6 +52,12 @@ pub struct Subject<T> {
     _phantom: PhantomData<fn(T)>,
 }
 
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref NEXT_SUBJECT_ID: AtomicUsize = AtomicUsize::new(0);
+}
+
+#[cfg(not(loom))]
 static NEXT_SUBJECT_ID: AtomicUsize = AtomicUsize::new(0);
 
 const MIN_CHUNK_BODY_SIZE: usize = 128;
@@ -315,11 +330,11 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
 /// use dynprops::{Subject, Extended};
 ///
 /// let subject = Subject::new();
-/// let prop = subject.new_prop_default_init();
+/// let mut prop = subject.new_prop_default_init();
 /// let mut obj = Extended::new_extend(5, &subject);
-/// obj.set(&prop, "Foo");
+/// obj.set(&mut prop, "Foo");
 /// assert_eq!(*obj.get(&prop), "Foo");
-/// *obj.get_mut(&prop) = "Bar";
+/// *obj.get_mut(&mut prop) = "Bar";
 /// assert_eq!(*obj.get(&prop), "Bar");
 /// ```
 ///
@@ -345,11 +360,11 @@ pub struct Extended<T> {
 /// use dynprops::{Subject, Dynamic};
 ///
 /// let subject = Subject::new();
-/// let prop = subject.new_prop_default_init();
+/// let mut prop = subject.new_prop_default_init();
 /// let mut obj = Dynamic::new(&subject);
-/// obj.set(&prop, "Foo");
+/// obj.set(&mut prop, "Foo");
 /// assert_eq!(*obj.get(&prop), "Foo");
-/// *obj.get_mut(&prop) = "Bar";
+/// *obj.get_mut(&mut prop) = "Bar";
 /// assert_eq!(*obj.get(&prop), "Bar");
 /// ```
 pub type Dynamic = Extended<()>;
@@ -377,7 +392,7 @@ impl<T> Extended<T> {
                     // Extending lifetime here because we need to drop the lock while returning
                     // a reference to something behind it. This is okay because the contents of the
                     // reference are initialized and can't change anymore (without a mutable
-                    // reference to the Extended).
+                    // reference to the the property).
                     return mem::transmute(res);
                 }
             },
@@ -409,12 +424,12 @@ impl<T> Extended<T> {
 
     /// Gets a mutable reference to a dynamic property in this [`Extended`], initializing
     /// it if needed.
-    pub fn get_mut<'a, P, I: Init<T, P>>(&'a mut self, index: &'a Property<T, P, I>) -> &'a mut P {
+    pub fn get_mut<'a, P, I: Init<T, P>>(&'a self, index: &'a mut Property<T, P, I>) -> &'a mut P {
         self.assert_subject(index.subject_id);
 
         // Search for chunk
-        let chunks = self.chunks.get_mut().unwrap();
-        match Self::find_chunk_mut(chunks, index.chunk_id) {
+        let mut chunks = self.chunks.lock().unwrap();
+        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
             Ok(chunk) => unsafe {
                 if let Some(res) = chunk.try_get_mut::<P>(index.offset, index.init_bit_offset) {
                     return mem::transmute(res);
@@ -423,11 +438,13 @@ impl<T> Extended<T> {
             Err(_) => {}
         }
 
-        // Initialize value
+        // Initialize value (make sure not to hold lock due to the potential for recursive access)
+        // TODO: Prevent simultaneous initializations of same value
+        drop(chunks);
         let init_value = index.initer.init(&self);
 
         // Search for chunk again
-        let mut chunks = self.chunks.get_mut().unwrap();
+        let mut chunks = self.chunks.lock().unwrap();
         match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
             Ok(chunk) => unsafe {
                 let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
@@ -438,18 +455,19 @@ impl<T> Extended<T> {
                 let chunk = Chunk::new(&index.chunk);
                 chunks.insert(after, chunk);
                 let chunk = &mut chunks[after];
-                return chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                return mem::transmute(res);
             },
         }
     }
 
     /// Sets the value of a dynamic property in this [`Extended`].
-    pub fn set<P, I: Init<T, P>>(&mut self, index: &Property<T, P, I>, value: P) {
+    pub fn set<P, I: Init<T, P>>(&self, index: &mut Property<T, P, I>, value: P) {
         self.assert_subject(index.subject_id);
 
         // Search for chunk
-        let chunks = self.chunks.get_mut().unwrap();
-        match Self::find_chunk_mut(chunks, index.chunk_id) {
+        let mut chunks = self.chunks.lock().unwrap();
+        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
             Ok(chunk) => unsafe {
                 chunk.set(index.offset, index.init_bit_offset, value);
             },
@@ -457,7 +475,6 @@ impl<T> Extended<T> {
                 // Initialize chunk
                 let mut chunk = Chunk::new(&index.chunk);
                 chunk.set(index.offset, index.init_bit_offset, value);
-                println!("New");
                 chunks.insert(after, chunk);
             },
         }
@@ -586,4 +603,9 @@ impl Drop for Chunk {
 }
 
 #[cfg(test)]
+#[cfg(not(loom))]
 mod tests;
+
+#[cfg(test)]
+#[cfg(loom)]
+mod tests_loom;
