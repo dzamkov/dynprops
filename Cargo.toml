@@ -1,6 +1,6 @@
 [package]
 name = "dynprops"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
 edition = "2018"
 description = "Creating and extending objects with typed dynamic properties"
@@ -10,6 +10,7 @@ keywords = ["dynamic", "properties"]
 categories = ["data-structures"]
 
 [dependencies]
+dynprops_derive = { path = "derive" }
 
 [dev-dependencies]
 lazy_static = "1.4.0"

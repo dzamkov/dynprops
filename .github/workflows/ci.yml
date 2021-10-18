@@ -27,5 +27,3 @@ jobs:
       run: rustup update stable && rustup default stable
     - name: Run tests
       run: cargo test --verbose
-    - name: Run Loom tests
-      run: RUSTFLAGS="--cfg loom -Dwarnings" cargo test --lib --release

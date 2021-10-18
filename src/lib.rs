@@ -3,64 +3,54 @@
 //! ## Example
 //!
 //! ```
-//! use dynprops::{Subject, Dynamic};
+//! use dynprops::*;
 //!
-//! let subject = Subject::new();
-//! let prop_a = subject.new_prop_const_init(5);
-//! let mut prop_b = subject.new_prop_const_init("Foo");
-//! let mut obj = Dynamic::new(&subject);
-//! assert_eq!(*obj.get(&prop_a), 5);
-//! assert_eq!(*obj.get(&prop_b), "Foo");
+//! // Define a type that can be extended with dynamic properties. To automatically derive Extend,
+//! // the type must be a struct with exactly one PropertyData field marked with #[prop_data]
+//! #[derive(Extend)]
+//! struct Dynamic { #[prop_data] prop_data: PropertyData }
+//!
+//! // Create and access properties on an value
+//! let prop_a = new_prop_const_init(5);
+//! let mut prop_b = new_prop_const_init("Foo");
+//! let mut obj = Dynamic { prop_data: PropertyData::new() };
+//! assert_eq!(*prop_a.get(&obj), 5);
+//! assert_eq!(*prop_b.get(&obj), "Foo");
 //!
 //! // Mutable properties can be changed on an object (even if the object is not mutable)
-//! obj.set(&mut prop_b, "Foobar");
-//! assert_eq!(*obj.get(&prop_b), "Foobar");
+//! prop_b.set(&obj, "Foobar");
+//! assert_eq!(*prop_b.get(&obj), "Foobar");
 //!
 //! // New properties can be introduced after an object is already created
-//! let prop_c = subject.new_prop_default_init::<u32>();
-//! assert_eq!(*obj.get(&prop_c), 0u32);
+//! let prop_c = new_prop_default_init::<Dynamic, u32>();
+//! assert_eq!(*prop_c.get(&obj), 0u32);
 //!
 //! // Properties can be initialized based on a function of other properties on the object
-//! let prop_d = subject.new_prop_fn_init(|obj| obj.get(&prop_b).len());
-//! assert_eq!(*obj.get(&prop_d), 6);
+//! let prop_d = new_prop_fn_init(|obj| prop_b.get(&obj).len());
+//! assert_eq!(*prop_d.get(&obj), 6);
 //! ```
+pub use dynprops_derive::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 use std::{mem, ptr, usize};
 
-#[cfg(loom)]
-use loom::sync::atomic::AtomicUsize;
+/// Types which can store values for arbitrary [`Property`]s.
+pub unsafe trait Extend {
+    /// Gets the [`Subject`] which identifies which [`Property`]s apply to values of this type.
+    /// This must return the same subject every time it is called.
+    fn subject() -> &'static Subject;
 
-#[cfg(loom)]
-use loom::sync::{Arc, Mutex};
-
-#[cfg(not(loom))]
-use std::sync::atomic::AtomicUsize;
-
-#[cfg(not(loom))]
-use std::sync::{Arc, Mutex};
+    /// Gets the [`PropertyData`] for this object.
+    fn prop_data(&self) -> &PropertyData;
+}
 
 /// Identifies a category of objects and a dynamic set of [`Property`]s that apply to those objects.
-/// New properties can be introduced into the subject at any time using [`Subject::new_prop`]
-/// and its derivatives. When accessing a property of an object, the subject of the property
-/// must match the subject of the object.
-pub struct Subject<T> {
-    id: usize,
+pub struct Subject {
     info: Mutex<SubjectInfo>,
-    _phantom: PhantomData<fn(T)>,
 }
-
-#[cfg(loom)]
-loom::lazy_static! {
-    static ref NEXT_SUBJECT_ID: AtomicUsize = AtomicUsize::new(0);
-}
-
-#[cfg(not(loom))]
-static NEXT_SUBJECT_ID: AtomicUsize = AtomicUsize::new(0);
-
-const MIN_CHUNK_BODY_SIZE: usize = 128;
 
 struct SubjectInfo {
     next_chunk_id: usize,
@@ -88,70 +78,15 @@ struct PropertyInfo {
     init_bit_offset: usize,
 }
 
-impl<T> Subject<T> {
+impl Subject {
     /// Creates a new subject.
     pub fn new() -> Self {
         Subject {
-            id: NEXT_SUBJECT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             info: Mutex::new(SubjectInfo {
                 next_chunk_id: 0,
                 open_chunks: Vec::new(),
             }),
-            _phantom: PhantomData,
         }
-    }
-
-    /// Creates a new property within this subject. An [`Init`] must be supplied to specify how the
-    /// initial value of the property is determined.
-    pub fn new_prop<P, I: Init<T, P>>(&self, initer: I) -> Property<T, P, I> {
-        let info = self.alloc_prop::<P>();
-        return Property {
-            subject_id: self.id,
-            chunk_id: info.chunk_id,
-            chunk: info.chunk,
-            offset: info.offset,
-            init_bit_offset: info.init_bit_offset,
-            initer,
-            _phantom: PhantomData,
-        };
-    }
-
-    /// Creates a new property within this subject. Upon initialization, the property will have the
-    /// default value (as defined by [`Default::default()`]) for type `P`.
-    pub fn new_prop_default_init<P: Default>(&self) -> DefaultInitProperty<T, P> {
-        self.new_prop(DefaultInit)
-    }
-
-    /// Creates a new property within this subject. Upon initialization, the property will have the
-    /// given value.
-    pub fn new_prop_const_init<P: Clone>(&self, value: P) -> ConstInitProperty<T, P> {
-        self.new_prop(ConstInit { value })
-    }
-
-    /// Creates a new property within this subject. Upon initialization, the value of the property
-    /// will be determined by executing the given closure.
-    ///
-    /// Since the closure takes the object itself, the initializer may reference the base value or
-    /// any other property that has been defined on [`Subject`]. For example:
-    /// ```
-    /// use dynprops::{Subject, Extended};
-    ///
-    /// let subject = Subject::new();
-    /// let prop_value = subject.new_prop_fn_init(|obj| obj.value);
-    /// let prop_double_value = subject.new_prop_fn_init(|obj| obj.get(&prop_value) * 2);
-    /// let prop_square_value = subject.new_prop_fn_init(|obj| obj.get(&prop_value) * obj.get(&prop_value));
-    /// let obj = Extended::new_extend(20, &subject);
-    /// assert_eq!(*obj.get(&prop_value), 20);
-    /// assert_eq!(*obj.get(&prop_double_value), 40);
-    /// assert_eq!(*obj.get(&prop_square_value), 400);
-    /// ```
-    /// The constraints on property lifetimes ensure that circular references between property
-    /// initializers are impossible.
-    pub fn new_prop_fn_init<P, F: Fn(&Extended<T>) -> P>(
-        &self,
-        init_fn: F,
-    ) -> FnInitProperty<T, P, F> {
-        self.new_prop(FnInit { init_fn })
     }
 
     fn alloc_prop<P>(&self) -> PropertyInfo {
@@ -159,6 +94,8 @@ impl<T> Subject<T> {
         return info.alloc_prop::<P>();
     }
 }
+
+const MIN_CHUNK_BODY_SIZE: usize = 128;
 
 impl SubjectInfo {
     fn alloc_prop<P>(&mut self) -> PropertyInfo {
@@ -233,15 +170,49 @@ impl ChunkInfo {
     }
 }
 
-/// Identifies a property that is present on objects of the appropriate [`Subject`].
-pub struct Property<T, P, I: Init<T, P>> {
-    subject_id: usize,
-    chunk_id: usize,
-    chunk: Arc<Mutex<ChunkInfo>>,
-    offset: usize,
-    init_bit_offset: usize,
+/// Identifies a property that is present on objects of type `T`.
+pub struct Property<T: Extend, P, I: Init<T, P>> {
+    info: PropertyInfo,
     initer: I,
     _phantom: PhantomData<fn(T) -> P>,
+}
+
+impl<T: Extend, P, I: Init<T, P>> Property<T, P, I> {
+    /// Creates a new property with the given value initializer.
+    pub fn new(initer: I) -> Self {
+        Self {
+            info: T::subject().alloc_prop::<P>(),
+            initer,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Gets the value of this property on the given object.
+    pub fn get<'a>(&'a self, obj: &'a T) -> &'a P {
+        unsafe { obj.prop_data().get(&self.info, || self.initer.init(&obj)) }
+    }
+
+    /// Gets a mutable reference to the value of this property on the given object.
+    pub fn get_mut<'a>(&'a mut self, obj: &'a T) -> &'a mut P {
+        unsafe {
+            obj.prop_data()
+                .get_mut(&self.info, || self.initer.init(&obj))
+        }
+    }
+
+    /// Sets the value of this property on the given object.
+    pub fn set(&mut self, obj: &T, value: P) {
+        unsafe { obj.prop_data().set(&self.info, value) }
+    }
+
+    /// Replaces the initializer on this property.
+    pub fn into_other_init<N: Init<T, P>>(self, initer: N) -> Property<T, P, N> {
+        Property {
+            info: self.info,
+            initer: initer,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 /// A shortcut for a [`Property`] that is initialized by a [`DefaultInit`].
@@ -257,22 +228,28 @@ pub type FnInitProperty<T, P, F> = Property<T, P, FnInit<F>>;
 /// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
 pub type DynInitProperty<T, P> = Property<T, P, DynInit<'static, T, P>>;
 
-impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
+/// Creates a new [`Property`] whose values are initialized using [`Default::default`].
+pub fn new_prop_default_init<T: Extend, P: Default>() -> DefaultInitProperty<T, P> {
+    Property::new(DefaultInit)
+}
+
+/// Creates a new [`Property`] whose values are initialized to the given constant.
+pub fn new_prop_const_init<T: Extend, P: Clone>(value: P) -> ConstInitProperty<T, P> {
+    Property::new(ConstInit { value })
+}
+
+/// Creates a new [`Property`] whose values are initialized using the given function.
+pub fn new_prop_fn_init<T: Extend, P, F: Fn(&T) -> P>(init_fn: F) -> FnInitProperty<T, P, F> {
+    Property::new(FnInit { init_fn })
+}
+
+impl<T: Extend, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
     /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
     /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
     pub fn into_dyn_init(mut self) -> DynInitProperty<T, P> {
         unsafe {
-            let result = Property {
-                subject_id: self.subject_id,
-                chunk_id: self.chunk_id,
-                chunk: ptr::read(&self.chunk),
-                offset: self.offset,
-                init_bit_offset: self.init_bit_offset,
-                initer: Box::new(ptr::read(&mut self.initer)) as DynInit<'static, T, P>,
-                _phantom: PhantomData,
-            };
-            mem::forget(self);
-            return result;
+            let initer = Box::new(ptr::read(&mut self.initer)) as DynInit<'static, T, P>;
+            self.into_other_init(initer)
         }
     }
 }
@@ -280,7 +257,7 @@ impl<T, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
 /// Defines how a [`Property`] is initialized when first accessed.
 pub trait Init<T, P> {
     /// Creates the initial value for the property on the given object.
-    fn init(&self, obj: &Extended<T>) -> P;
+    fn init(&self, obj: &T) -> P;
 }
 
 /// An [`Init`] which initializes values using [`Default::default()`].
@@ -299,190 +276,135 @@ pub struct FnInit<F> {
 /// An [`Init`] that uses dynamic dispatch to defer to another [`Init`] at runtime.
 pub type DynInit<'a, T, P> = Box<dyn 'a + Sync + Init<T, P>>;
 
-impl<T, P, F: Fn(&Extended<T>) -> P> Init<T, P> for FnInit<F> {
-    fn init(&self, obj: &Extended<T>) -> P {
+impl<T, P, F: Fn(&T) -> P> Init<T, P> for FnInit<F> {
+    fn init(&self, obj: &T) -> P {
         (self.init_fn)(obj)
     }
 }
 
 impl<T, P: Clone> Init<T, P> for ConstInit<P> {
-    fn init(&self, _obj: &Extended<T>) -> P {
+    fn init(&self, _obj: &T) -> P {
         self.value.clone()
     }
 }
 
 impl<T, P: Default> Init<T, P> for DefaultInit {
-    fn init(&self, _obj: &Extended<T>) -> P {
+    fn init(&self, _obj: &T) -> P {
         Default::default()
     }
 }
 
 impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
-    fn init(&self, obj: &Extended<T>) -> P {
+    fn init(&self, obj: &T) -> P {
         self.as_ref().init(obj)
     }
 }
 
-/// Extends a value of type `T` with properties defined in a particular [`Subject<T>`].
-///
-/// Property values are accessed using `get`, `get_mut` and `set`, like so:
-/// ```
-/// use dynprops::{Subject, Extended};
-///
-/// let subject = Subject::new();
-/// let mut prop = subject.new_prop_default_init();
-/// let mut obj = Extended::new_extend(5, &subject);
-/// obj.set(&mut prop, "Foo");
-/// assert_eq!(*obj.get(&prop), "Foo");
-/// *obj.get_mut(&mut prop) = "Bar";
-/// assert_eq!(*obj.get(&prop), "Bar");
-/// ```
-///
-/// The base value of an [`Extended`] object can always be accessed through the `value` field:
-/// ```
-/// use dynprops::{Subject, Extended};
-///
-/// let subject = Subject::new();
-/// let mut obj = Extended::new_extend(5, &subject);
-/// obj.value = 15;
-/// assert_eq!(obj.value, 15);
-/// ```
-pub struct Extended<T> {
-    pub value: T,
-    subject_id: usize,
+/// Encapsulates the values for all the [`Property`]s on an object.
+pub struct PropertyData {
     chunks: Mutex<Vec<Chunk>>,
 }
 
-/// An object consisting entirely of dynamic properties defined in a particular [`Subject`].
-///
-/// Property values are accessed using `get`, `get_mut` and `set`, like so:
-/// ```
-/// use dynprops::{Subject, Dynamic};
-///
-/// let subject = Subject::new();
-/// let mut prop = subject.new_prop_default_init();
-/// let mut obj = Dynamic::new(&subject);
-/// obj.set(&mut prop, "Foo");
-/// assert_eq!(*obj.get(&prop), "Foo");
-/// *obj.get_mut(&mut prop) = "Bar";
-/// assert_eq!(*obj.get(&prop), "Bar");
-/// ```
-pub type Dynamic = Extended<()>;
-
-impl<T> Extended<T> {
-    /// Creates an [`Extended`] wrapper over the given value. This extends it with all of the
-    /// [`Property`]s defined on `subject`.
-    pub fn new_extend(value: T, subject: &Subject<T>) -> Self {
-        Extended {
-            value,
-            subject_id: subject.id,
+impl PropertyData {
+    /// Creates a [`PropertyData`] with all properties uninitialized.
+    pub fn new() -> Self {
+        PropertyData {
             chunks: Mutex::new(Vec::new()),
         }
     }
 
-    /// Gets a dynamic property in this [`Extended`], initializing it if needed.
-    pub fn get<'a, P, I: Init<T, P>>(&'a self, index: &'a Property<T, P, I>) -> &'a P {
-        self.assert_subject(index.subject_id);
-
+    /// Gets a dynamic property in this [`PropertyData`], initializing it if needed.
+    unsafe fn get<P>(&self, info: &PropertyInfo, initer: impl Fn() -> P) -> &P {
         // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();
-        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
-            Ok(chunk) => unsafe {
-                if let Some(res) = chunk.try_get_mut::<P>(index.offset, index.init_bit_offset) {
+        match Self::find_chunk_mut(&mut chunks, info.chunk_id) {
+            Ok(chunk) => {
+                if let Some(res) = chunk.try_get_mut::<P>(info.offset, info.init_bit_offset) {
                     // Extending lifetime here because we need to drop the lock while returning
                     // a reference to something behind it. This is okay because the contents of the
                     // reference are initialized and can't change anymore (without a mutable
                     // reference to the the property).
                     return mem::transmute(res);
                 }
-            },
+            }
             Err(_) => {}
         }
 
         // Initialize value (make sure not to hold lock due to the potential for recursive access)
         // TODO: Prevent simultaneous initializations of same value
         drop(chunks);
-        let init_value = index.initer.init(&self);
+        let init_value = initer();
 
         // Search for chunk again
         let mut chunks = self.chunks.lock().unwrap();
-        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
-            Ok(chunk) => unsafe {
-                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+        match Self::find_chunk_mut(&mut chunks, info.chunk_id) {
+            Ok(chunk) => {
+                let res = chunk.get_mut_with_init(info.offset, info.init_bit_offset, init_value);
                 return mem::transmute(res);
-            },
-            Err(after) => unsafe {
+            }
+            Err(after) => {
                 // Initialize chunk
-                let chunk = Chunk::new(&index.chunk);
+                let chunk = Chunk::new(&info.chunk);
                 chunks.insert(after, chunk);
                 let chunk = &mut chunks[after];
-                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                let res = chunk.get_mut_with_init(info.offset, info.init_bit_offset, init_value);
                 return mem::transmute(res);
-            },
+            }
         }
     }
 
-    /// Gets a mutable reference to a dynamic property in this [`Extended`], initializing
+    /// Gets a mutable reference to a dynamic property in this [`PropertyData`], initializing
     /// it if needed.
-    pub fn get_mut<'a, P, I: Init<T, P>>(&'a self, index: &'a mut Property<T, P, I>) -> &'a mut P {
-        self.assert_subject(index.subject_id);
-
+    unsafe fn get_mut<P>(&self, info: &PropertyInfo, initer: impl Fn() -> P) -> &mut P {
         // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();
-        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
-            Ok(chunk) => unsafe {
-                if let Some(res) = chunk.try_get_mut::<P>(index.offset, index.init_bit_offset) {
+        match Self::find_chunk_mut(&mut chunks, info.chunk_id) {
+            Ok(chunk) => {
+                if let Some(res) = chunk.try_get_mut::<P>(info.offset, info.init_bit_offset) {
                     return mem::transmute(res);
                 }
-            },
+            }
             Err(_) => {}
         }
 
         // Initialize value (make sure not to hold lock due to the potential for recursive access)
         // TODO: Prevent simultaneous initializations of same value
         drop(chunks);
-        let init_value = index.initer.init(&self);
+        let init_value = initer();
 
         // Search for chunk again
         let mut chunks = self.chunks.lock().unwrap();
-        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
-            Ok(chunk) => unsafe {
-                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+        match Self::find_chunk_mut(&mut chunks, info.chunk_id) {
+            Ok(chunk) => {
+                let res = chunk.get_mut_with_init(info.offset, info.init_bit_offset, init_value);
                 return mem::transmute(res);
-            },
-            Err(after) => unsafe {
+            }
+            Err(after) => {
                 // Initialize chunk
-                let chunk = Chunk::new(&index.chunk);
+                let chunk = Chunk::new(&info.chunk);
                 chunks.insert(after, chunk);
                 let chunk = &mut chunks[after];
-                let res = chunk.get_mut_with_init(index.offset, index.init_bit_offset, init_value);
+                let res = chunk.get_mut_with_init(info.offset, info.init_bit_offset, init_value);
                 return mem::transmute(res);
-            },
+            }
         }
     }
 
-    /// Sets the value of a dynamic property in this [`Extended`].
-    pub fn set<P, I: Init<T, P>>(&self, index: &mut Property<T, P, I>, value: P) {
-        self.assert_subject(index.subject_id);
-
+    /// Sets the value of a dynamic property in this [`PropertyData`].
+    unsafe fn set<P>(&self, info: &PropertyInfo, value: P) {
         // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();
-        match Self::find_chunk_mut(&mut chunks, index.chunk_id) {
-            Ok(chunk) => unsafe {
-                chunk.set(index.offset, index.init_bit_offset, value);
-            },
-            Err(after) => unsafe {
+        match Self::find_chunk_mut(&mut chunks, info.chunk_id) {
+            Ok(chunk) => {
+                chunk.set(info.offset, info.init_bit_offset, value);
+            }
+            Err(after) => {
                 // Initialize chunk
-                let mut chunk = Chunk::new(&index.chunk);
-                chunk.set(index.offset, index.init_bit_offset, value);
+                let mut chunk = Chunk::new(&info.chunk);
+                chunk.set(info.offset, info.init_bit_offset, value);
                 chunks.insert(after, chunk);
-            },
+            }
         }
-    }
-
-    /// Asserts that this [`Extended`] is of the given subject.
-    fn assert_subject(&self, subject_id: usize) {
-        assert_eq!(self.subject_id, subject_id, "Subject mismatch");
     }
 
     /// Searches for the chunk with the given id within `chunks`. Returns a reference to the chunk
@@ -515,14 +437,7 @@ impl<T> Extended<T> {
     }
 }
 
-impl Dynamic {
-    /// Creates a new [`Dynamic`] object.
-    pub fn new(subject: &Subject<()>) -> Self {
-        Self::new_extend((), subject)
-    }
-}
-
-/// Describes a chunk within an [`Extended`].
+/// Describes a chunk within [`PropertyData`].
 struct Chunk {
     id: usize,
     info: Arc<Mutex<ChunkInfo>>,
@@ -601,11 +516,3 @@ impl Drop for Chunk {
         }
     }
 }
-
-#[cfg(test)]
-#[cfg(not(loom))]
-mod tests;
-
-#[cfg(test)]
-#[cfg(loom)]
-mod tests_loom;

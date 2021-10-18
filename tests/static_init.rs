@@ -1,32 +1,32 @@
 use dynprops::*;
 use static_init::dynamic;
 
+#[derive(Extend)]
 struct Context {
     param: i32,
+    #[prop_data]
+    prop_data: PropertyData,
 }
 
 #[dynamic]
-static CONTEXT: Subject<Context> = Subject::new();
+static DOUBLE: DynInitProperty<Context, i32> =
+    new_prop_fn_init(|context: &Context| context.param * 2).into_dyn_init();
 
 #[dynamic]
-static DOUBLE: DynInitProperty<Context, i32> = CONTEXT
-    .new_prop_fn_init(|context| context.value.param * 2)
-    .into_dyn_init();
+static SQUARE: DynInitProperty<Context, i32> =
+    new_prop_fn_init(|context: &Context| context.param * context.param).into_dyn_init();
 
 #[dynamic]
-static SQUARE: DynInitProperty<Context, i32> = CONTEXT
-    .new_prop_fn_init(|context| context.value.param * context.value.param)
-    .into_dyn_init();
-
-#[dynamic]
-static SQUARE_PLUS_DOUBLE: DynInitProperty<Context, i32> = CONTEXT
-    .new_prop_fn_init(|context| context.get(&SQUARE) + context.get(&DOUBLE))
-    .into_dyn_init();
+static SQUARE_PLUS_DOUBLE: DynInitProperty<Context, i32> =
+    new_prop_fn_init(|context: &Context| SQUARE.get(context) + DOUBLE.get(context)).into_dyn_init();
 
 #[test]
 fn test_static_init() {
-    let obj = Extended::new_extend(Context { param: 5 }, &CONTEXT);
-    assert_eq!(*obj.get(&DOUBLE), 10);
-    assert_eq!(*obj.get(&SQUARE), 25);
-    assert_eq!(*obj.get(&SQUARE_PLUS_DOUBLE), 35);
+    let obj = Context {
+        param: 3,
+        prop_data: PropertyData::new(),
+    };
+    assert_eq!(*DOUBLE.get(&obj), 6);
+    assert_eq!(*SQUARE.get(&obj), 9);
+    assert_eq!(*SQUARE_PLUS_DOUBLE.get(&obj), 15);
 }
