@@ -1,4 +1,4 @@
-use dynprops::{Extend, PropertyData, new_prop_const_init};
+use dynprops::{new_prop_const_init, Extend, PropertyData};
 use std::cell::Cell;
 use std::sync::Arc;
 

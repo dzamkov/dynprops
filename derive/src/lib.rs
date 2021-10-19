@@ -15,7 +15,7 @@ pub fn derive_extend(input: TokenStream) -> TokenStream {
                 static ONCE: ::std::sync::Once = ::std::sync::Once::new();
                 static mut VALUE: *mut ::dynprops::Subject = 0 as *mut ::dynprops::Subject;
                 unsafe {
-                    ONCE.call_once(|| { 
+                    ONCE.call_once(|| {
                         let subject = ::dynprops::Subject::new();
                         VALUE = ::std::boxed::Box::into_raw(::std::boxed::Box::new(subject));
                     });
