@@ -1,6 +1,6 @@
 [package]
 name = "dynprops"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
 edition = "2018"
 description = "Creating and extending objects with typed dynamic properties"
