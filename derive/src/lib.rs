@@ -11,16 +11,16 @@ pub fn derive_extend(input: TokenStream) -> TokenStream {
     let prop_data = prop_data(&input.data);
     TokenStream::from(quote! {
         unsafe impl #impl_generics Extend for #name #ty_generics #where_clause {
-            fn subject() -> &'static dynprops::Subject {
+            fn subject() -> &'static ::dynprops::Subject {
                 static ONCE: std::sync::Once = std::sync::Once::new();
-                static mut VALUE: *mut dynprops::Subject = 0 as *mut dynprops::Subject;
+                static mut VALUE: *mut ::dynprops::Subject = 0 as *mut ::dynprops::Subject;
                 unsafe {
                     ONCE.call_once(|| { VALUE = Box::into_raw(Box::new(Subject::new())); });
                     &*VALUE
                 }
             }
 
-            fn prop_data(&self) -> &dynprops::PropertyData {
+            fn prop_data(&self) -> &::dynprops::PropertyData {
                 #prop_data
             }
         }

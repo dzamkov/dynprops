@@ -8,27 +8,28 @@
 //! // Define a type that can be extended with dynamic properties. To automatically derive Extend,
 //! // the type must be a struct with exactly one PropertyData field marked with #[prop_data]
 //! #[derive(Extend)]
-//! struct Dynamic { #[prop_data] prop_data: PropertyData }
+//! struct Thing { #[prop_data] prop_data: PropertyData }
 //!
 //! // Create and access properties on an value
 //! let prop_a = new_prop_const_init(5);
 //! let mut prop_b = new_prop_const_init("Foo");
-//! let mut obj = Dynamic { prop_data: PropertyData::new() };
-//! assert_eq!(*prop_a.get(&obj), 5);
-//! assert_eq!(*prop_b.get(&obj), "Foo");
+//! let thing = Thing { prop_data: PropertyData::new() };
+//! assert_eq!(*prop_a.get(&thing), 5);
+//! assert_eq!(*prop_b.get(&thing), "Foo");
 //!
-//! // Mutable properties can be changed on an object (even if the object is not mutable)
-//! prop_b.set(&obj, "Foobar");
-//! assert_eq!(*prop_b.get(&obj), "Foobar");
+//! // Mutable properties can be changed on a value (even if the value is not mutable)
+//! prop_b.set(&thing, "Foobar");
+//! assert_eq!(*prop_b.get(&thing), "Foobar");
 //!
 //! // New properties can be introduced after an object is already created
-//! let prop_c = new_prop_default_init::<Dynamic, u32>();
-//! assert_eq!(*prop_c.get(&obj), 0u32);
+//! let prop_c = new_prop_default_init::<Thing, u32>();
+//! assert_eq!(*prop_c.get(&thing), 0u32);
 //!
 //! // Properties can be initialized based on a function of other properties on the object
-//! let prop_d = new_prop_fn_init(|obj| prop_b.get(&obj).len());
-//! assert_eq!(*prop_d.get(&obj), 6);
+//! let prop_d = new_prop_fn_init(|thing| prop_b.get(&thing).len());
+//! assert_eq!(*prop_d.get(&thing), 6);
 //! ```
+extern crate self as dynprops;
 pub use dynprops_derive::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::cmp::max;
@@ -298,6 +299,78 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
     fn init(&self, obj: &T) -> P {
         self.as_ref().init(obj)
     }
+}
+
+/// A value consisting entirely of dynamic [`Property`]s.
+///
+/// ## Example
+///
+/// ```
+/// use dynprops::{Dynamic, new_prop_default_init};
+///
+/// let mut prop = new_prop_default_init::<Dynamic, &'static str>();
+/// let obj = Dynamic::new();
+/// prop.set(&obj, "Foo");
+/// assert_eq!(*prop.get(&obj), "Foo");
+/// *prop.get_mut(&obj) = "Bar";
+/// assert_eq!(*prop.get(&obj), "Bar");
+/// ```
+#[derive(Extend)]
+pub struct Dynamic {
+    #[prop_data]
+    prop_data: PropertyData,
+}
+
+impl Dynamic {
+    /// Creates a new [`Dynamic`].
+    pub fn new() -> Self {
+        Self {
+            prop_data: PropertyData::new(),
+        }
+    }
+}
+
+/// Augments a value with the ability to store dynamic [`Property`]s.
+///
+/// ## Example
+///
+/// ```
+/// use dynprops::{Extended, new_prop_default_init};
+///
+/// let mut prop = new_prop_default_init::<Extended<u32>, &'static str>();
+/// let obj = Extended::new(42);
+/// assert_eq!(obj.value, 42);
+/// prop.set(&obj, "Foo");
+/// assert_eq!(*prop.get(&obj), "Foo");
+/// *prop.get_mut(&obj) = "Bar";
+/// assert_eq!(*prop.get(&obj), "Bar");
+/// ```
+#[derive(Extend)]
+pub struct Extended<T> {
+    pub value: T,
+    #[prop_data]
+    prop_data: PropertyData,
+}
+
+impl<T> Extended<T> {
+    /// Creates a new [`Extended`].
+    pub fn new(value: T) -> Self {
+        Self {
+            value,
+            prop_data: PropertyData::new(),
+        }
+    }
+}
+
+// Generics should have different subjects for each generic parameter, since this will prevent
+// inapplicable properties from taking up space in the PropertyData.
+#[test]
+#[ignore]
+fn test_generic_subject() {
+    // TODO
+    let subject_a = Extended::<u32>::subject();
+    let subject_b = Extended::<f32>::subject();
+    assert_ne!(subject_a as *const Subject, subject_b as *const Subject);
 }
 
 /// Encapsulates the values for all the [`Property`]s on an object.

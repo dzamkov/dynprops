@@ -1,6 +1,6 @@
 [package]
 name = "dynprops"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Dmitry Zamkov <dmitry94@gmail.com>"]
 edition = "2018"
 description = "Creating and extending objects with typed dynamic properties"
@@ -15,6 +15,3 @@ dynprops_derive = { path = "derive" }
 [dev-dependencies]
 lazy_static = "1.4.0"
 static_init = "1.0.1"
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.5.1"
