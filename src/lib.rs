@@ -8,7 +8,7 @@
 //! // Define a type that can be extended with dynamic properties. To automatically derive Extend,
 //! // the type must be a struct with exactly one PropertyData field marked with #[prop_data]
 //! #[derive(Extend)]
-//! struct Thing { #[prop_data] prop_data: PropertyData }
+//! struct Thing { #[prop_data] prop_data: PropertyData<Thing> }
 //!
 //! // Create and access properties on an value
 //! let mut prop_a = Property::new();
@@ -42,7 +42,7 @@ pub unsafe trait Extend {
     fn subject() -> &'static Subject;
 
     /// Gets the [`PropertyData`] for this object.
-    fn prop_data(&self) -> &PropertyData;
+    fn prop_data(&self) -> &PropertyData<Self>;
 }
 
 /// Identifies a category of objects and a dynamic set of [`Property`]s that apply to those objects.
@@ -186,18 +186,18 @@ impl<T: Extend, P> Property<T, P> {
     /// Gets the value of this property on the given object. If the property has never been
     /// accessed before, it's value will be initialized using `init`.
     pub fn get_with_init<'a>(&'a self, obj: &'a T, init: impl Fn() -> P) -> &'a P {
-        unsafe { obj.prop_data().get(&self.info, init) }
+        unsafe { obj.prop_data().source.get(&self.info, init) }
     }
 
     /// Gets a mutable reference to the value of this property on the given object. If the property
     /// has never been accessed before, it's value will be initialized using `init`.
     pub fn get_mut_with_init<'a>(&'a mut self, obj: &'a T, init: impl Fn() -> P) -> &'a mut P {
-        unsafe { obj.prop_data().get_mut(&self.info, init) }
+        unsafe { obj.prop_data().source.get_mut(&self.info, init) }
     }
 
     /// Sets the value of this property on the given object.
     pub fn set(&mut self, obj: &T, value: P) {
-        unsafe { obj.prop_data().set(&self.info, value) }
+        unsafe { obj.prop_data().source.set(&self.info, value) }
     }
 }
 
@@ -205,13 +205,21 @@ impl<T: Extend, P: Default> Property<T, P> {
     /// Gets the value of this property on the given object. If the property has never been
     /// accessed before, it's value will be initialized to [`Default::default()`].
     pub fn get<'a>(&'a self, obj: &'a T) -> &'a P {
-        unsafe { obj.prop_data().get(&self.info, || Default::default()) }
+        unsafe {
+            obj.prop_data()
+                .source
+                .get(&self.info, || Default::default())
+        }
     }
 
     /// Gets a mutable reference to the value of this property on the given object. If the property
     /// has never been accessed before, it's value will be initialized to [`Default::default()`].
     pub fn get_mut<'a>(&'a mut self, obj: &'a T) -> &'a mut P {
-        unsafe { obj.prop_data().get_mut(&self.info, || Default::default()) }
+        unsafe {
+            obj.prop_data()
+                .source
+                .get_mut(&self.info, || Default::default())
+        }
     }
 }
 
@@ -232,7 +240,7 @@ impl<T: Extend, P: Default> Property<T, P> {
 #[derive(Extend)]
 pub struct Dynamic {
     #[prop_data]
-    prop_data: PropertyData,
+    prop_data: PropertyData<Dynamic>,
 }
 
 impl Dynamic {
@@ -263,7 +271,7 @@ impl Dynamic {
 pub struct Extended<T> {
     pub value: T,
     #[prop_data]
-    prop_data: PropertyData,
+    prop_data: PropertyData<Extended<T>>,
 }
 
 impl<T> Extended<T> {
@@ -276,20 +284,36 @@ impl<T> Extended<T> {
     }
 }
 
+/// Encapsulates the values for all the [`Property`]s on an object of the given type.
+pub struct PropertyData<T: ?Sized> {
+    source: RawPropertyData,
+    _marker: PhantomData<dyn Fn() -> T>,
+}
+
+impl<T> PropertyData<T> {
+    /// Creates a [`PropertyData`] with all properties uninitialized.
+    pub fn new() -> Self {
+        Self {
+            source: RawPropertyData::new(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// Encapsulates the values for all the [`Property`]s on an object.
-pub struct PropertyData {
+struct RawPropertyData {
     chunks: Mutex<Vec<Chunk>>,
 }
 
-impl PropertyData {
-    /// Creates a [`PropertyData`] with all properties uninitialized.
+impl RawPropertyData {
+    /// Creates a [`RawPropertyData`] with all properties uninitialized.
     pub fn new() -> Self {
-        PropertyData {
+        RawPropertyData {
             chunks: Mutex::new(Vec::new()),
         }
     }
 
-    /// Gets a dynamic property in this [`PropertyData`], initializing it if needed.
+    /// Gets a dynamic property in this [`RawPropertyData`], initializing it if needed.
     unsafe fn get<P>(&self, info: &PropertyInfo, initer: impl Fn() -> P) -> &P {
         // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();
@@ -329,7 +353,7 @@ impl PropertyData {
         }
     }
 
-    /// Gets a mutable reference to a dynamic property in this [`PropertyData`], initializing
+    /// Gets a mutable reference to a dynamic property in this [`RawPropertyData`], initializing
     /// it if needed.
     unsafe fn get_mut<P>(&self, info: &PropertyInfo, initer: impl Fn() -> P) -> &mut P {
         // Search for chunk
@@ -366,7 +390,7 @@ impl PropertyData {
         }
     }
 
-    /// Sets the value of a dynamic property in this [`PropertyData`].
+    /// Sets the value of a dynamic property in this [`RawPropertyData`].
     unsafe fn set<P>(&self, info: &PropertyInfo, value: P) {
         // Search for chunk
         let mut chunks = self.chunks.lock().unwrap();

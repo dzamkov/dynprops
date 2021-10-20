@@ -23,7 +23,7 @@ pub fn derive_extend(input: TokenStream) -> TokenStream {
                 }
             }
 
-            fn prop_data(&self) -> &::dynprops::PropertyData {
+            fn prop_data(&self) -> &::dynprops::PropertyData<#name #ty_generics> {
                 #prop_data
             }
         }
