@@ -11,24 +11,21 @@
 //! struct Thing { #[prop_data] prop_data: PropertyData }
 //!
 //! // Create and access properties on an value
-//! let prop_a = new_prop_const_init(5);
-//! let mut prop_b = new_prop_const_init("Foo");
+//! let mut prop_a = Property::new();
+//! let mut prop_b = Property::new();
 //! let thing = Thing { prop_data: PropertyData::new() };
+//! prop_a.set(&thing, 5);
+//! prop_b.set(&thing, "Foo");
 //! assert_eq!(*prop_a.get(&thing), 5);
 //! assert_eq!(*prop_b.get(&thing), "Foo");
 //!
-//! // Mutable properties can be changed on a value (even if the value is not mutable)
-//! prop_b.set(&thing, "Foobar");
-//! assert_eq!(*prop_b.get(&thing), "Foobar");
-//!
 //! // New properties can be introduced after an object is already created
-//! let prop_c = new_prop_default_init::<Thing, u32>();
-//! assert_eq!(*prop_c.get(&thing), 0u32);
-//!
-//! // Properties can be initialized based on a function of other properties on the object
-//! let prop_d = new_prop_fn_init(|thing| prop_b.get(&thing).len());
-//! assert_eq!(*prop_d.get(&thing), 6);
+//! let prop_c = Property::<Thing, u32>::new();
+//! assert_eq!(*prop_c.get_with_init(&thing, || 2 + 3), 5);
 //! ```
+#[cfg(test)]
+mod tests;
+
 extern crate self as dynprops;
 pub use dynprops_derive::*;
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
@@ -172,132 +169,49 @@ impl ChunkInfo {
 }
 
 /// Identifies a property that is present on objects of type `T`.
-pub struct Property<T: Extend, P, I: Init<T, P>> {
+pub struct Property<T: Extend, P> {
     info: PropertyInfo,
-    initer: I,
     _phantom: PhantomData<fn(T) -> P>,
 }
 
-impl<T: Extend, P, I: Init<T, P>> Property<T, P, I> {
-    /// Creates a new property with the given value initializer.
-    pub fn new(initer: I) -> Self {
+impl<T: Extend, P> Property<T, P> {
+    /// Creates a new property.
+    pub fn new() -> Self {
         Self {
             info: T::subject().alloc_prop::<P>(),
-            initer,
             _phantom: PhantomData,
         }
     }
 
-    /// Gets the value of this property on the given object.
-    pub fn get<'a>(&'a self, obj: &'a T) -> &'a P {
-        unsafe { obj.prop_data().get(&self.info, || self.initer.init(&obj)) }
+    /// Gets the value of this property on the given object. If the property has never been
+    /// accessed before, it's value will be initialized using `init`.
+    pub fn get_with_init<'a>(&'a self, obj: &'a T, init: impl Fn() -> P) -> &'a P {
+        unsafe { obj.prop_data().get(&self.info, init) }
     }
 
-    /// Gets a mutable reference to the value of this property on the given object.
-    pub fn get_mut<'a>(&'a mut self, obj: &'a T) -> &'a mut P {
-        unsafe {
-            obj.prop_data()
-                .get_mut(&self.info, || self.initer.init(&obj))
-        }
+    /// Gets a mutable reference to the value of this property on the given object. If the property
+    /// has never been accessed before, it's value will be initialized using `init`.
+    pub fn get_mut_with_init<'a>(&'a mut self, obj: &'a T, init: impl Fn() -> P) -> &'a mut P {
+        unsafe { obj.prop_data().get_mut(&self.info, init) }
     }
 
     /// Sets the value of this property on the given object.
     pub fn set(&mut self, obj: &T, value: P) {
         unsafe { obj.prop_data().set(&self.info, value) }
     }
+}
 
-    /// Replaces the initializer on this property.
-    pub fn into_other_init<N: Init<T, P>>(self, initer: N) -> Property<T, P, N> {
-        Property {
-            info: self.info,
-            initer: initer,
-            _phantom: PhantomData,
-        }
+impl<T: Extend, P: Default> Property<T, P> {
+    /// Gets the value of this property on the given object. If the property has never been
+    /// accessed before, it's value will be initialized to [`Default::default()`].
+    pub fn get<'a>(&'a self, obj: &'a T) -> &'a P {
+        unsafe { obj.prop_data().get(&self.info, || Default::default()) }
     }
-}
 
-/// A shortcut for a [`Property`] that is initialized by a [`DefaultInit`].
-pub type DefaultInitProperty<T, P> = Property<T, P, DefaultInit>;
-
-/// A shortcut for a [`Property`] that is initialized by a [`ConstInit`].
-pub type ConstInitProperty<T, P> = Property<T, P, ConstInit<P>>;
-
-/// A shortcut for a [`Property`] that is initialized by a [`FnInit`].
-pub type FnInitProperty<T, P, F> = Property<T, P, FnInit<F>>;
-
-/// A shortcut for a [`Property`] that is initialized by a [`DynInit`]. Any property can be
-/// converted into a [`DynInitProperty`] using [`Property::into_dyn_init`].
-pub type DynInitProperty<T, P> = Property<T, P, DynInit<'static, T, P>>;
-
-/// Creates a new [`Property`] whose values are initialized using [`Default::default`].
-pub fn new_prop_default_init<T: Extend, P: Default>() -> DefaultInitProperty<T, P> {
-    Property::new(DefaultInit)
-}
-
-/// Creates a new [`Property`] whose values are initialized to the given constant.
-pub fn new_prop_const_init<T: Extend, P: Clone>(value: P) -> ConstInitProperty<T, P> {
-    Property::new(ConstInit { value })
-}
-
-/// Creates a new [`Property`] whose values are initialized using the given function.
-pub fn new_prop_fn_init<T: Extend, P, F: Fn(&T) -> P>(init_fn: F) -> FnInitProperty<T, P, F> {
-    Property::new(FnInit { init_fn })
-}
-
-impl<T: Extend, P, I: 'static + Init<T, P> + Sync> Property<T, P, I> {
-    /// Converts this property into a [`DynInitProperty`] by wrapping its initializer in a
-    /// [`DynInit`]. Note that this will add overhead if it is already a [`DynInitProperty`].
-    pub fn into_dyn_init(mut self) -> DynInitProperty<T, P> {
-        unsafe {
-            let initer = Box::new(ptr::read(&mut self.initer)) as DynInit<'static, T, P>;
-            self.into_other_init(initer)
-        }
-    }
-}
-
-/// Defines how a [`Property`] is initialized when first accessed.
-pub trait Init<T, P> {
-    /// Creates the initial value for the property on the given object.
-    fn init(&self, obj: &T) -> P;
-}
-
-/// An [`Init`] which initializes values using [`Default::default()`].
-pub struct DefaultInit;
-
-/// An [`Init`] which initializes values by cloning a given value.
-pub struct ConstInit<P: Clone> {
-    pub value: P,
-}
-
-/// An [`Init`] which initializes values by executing a closure.
-pub struct FnInit<F> {
-    pub init_fn: F,
-}
-
-/// An [`Init`] that uses dynamic dispatch to defer to another [`Init`] at runtime.
-pub type DynInit<'a, T, P> = Box<dyn 'a + Sync + Init<T, P>>;
-
-impl<T, P, F: Fn(&T) -> P> Init<T, P> for FnInit<F> {
-    fn init(&self, obj: &T) -> P {
-        (self.init_fn)(obj)
-    }
-}
-
-impl<T, P: Clone> Init<T, P> for ConstInit<P> {
-    fn init(&self, _obj: &T) -> P {
-        self.value.clone()
-    }
-}
-
-impl<T, P: Default> Init<T, P> for DefaultInit {
-    fn init(&self, _obj: &T) -> P {
-        Default::default()
-    }
-}
-
-impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
-    fn init(&self, obj: &T) -> P {
-        self.as_ref().init(obj)
+    /// Gets a mutable reference to the value of this property on the given object. If the property
+    /// has never been accessed before, it's value will be initialized to [`Default::default()`].
+    pub fn get_mut<'a>(&'a mut self, obj: &'a T) -> &'a mut P {
+        unsafe { obj.prop_data().get_mut(&self.info, || Default::default()) }
     }
 }
 
@@ -306,9 +220,9 @@ impl<'a, T, P> Init<T, P> for DynInit<'a, T, P> {
 /// ## Example
 ///
 /// ```
-/// use dynprops::{Dynamic, new_prop_default_init};
+/// use dynprops::{Dynamic, Property};
 ///
-/// let mut prop = new_prop_default_init::<Dynamic, &'static str>();
+/// let mut prop = Property::new();
 /// let obj = Dynamic::new();
 /// prop.set(&obj, "Foo");
 /// assert_eq!(*prop.get(&obj), "Foo");
@@ -335,9 +249,9 @@ impl Dynamic {
 /// ## Example
 ///
 /// ```
-/// use dynprops::{Extended, new_prop_default_init};
+/// use dynprops::{Extended, Property};
 ///
-/// let mut prop = new_prop_default_init::<Extended<u32>, &'static str>();
+/// let mut prop = Property::new();
 /// let obj = Extended::new(42);
 /// assert_eq!(obj.value, 42);
 /// prop.set(&obj, "Foo");
@@ -360,17 +274,6 @@ impl<T> Extended<T> {
             prop_data: PropertyData::new(),
         }
     }
-}
-
-// Generics should have different subjects for each generic parameter, since this will prevent
-// inapplicable properties from taking up space in the PropertyData.
-#[test]
-#[ignore]
-fn test_generic_subject() {
-    // TODO
-    let subject_a = Extended::<u32>::subject();
-    let subject_b = Extended::<f32>::subject();
-    assert_ne!(subject_a as *const Subject, subject_b as *const Subject);
 }
 
 /// Encapsulates the values for all the [`Property`]s on an object.
