@@ -1,5 +1,6 @@
 use crate::*;
 use std::cell::Cell;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 #[test]
@@ -71,4 +72,49 @@ fn test_generic_subject() {
     let subject_a = Extended::<u32>::subject();
     let subject_b = Extended::<f32>::subject();
     assert_ne!(subject_a as *const Subject, subject_b as *const Subject);
+}
+
+#[derive(Extend)]
+struct MemoizeThing {
+    num_reads: AtomicUsize,
+    #[prop_data]
+    prop_data: PropertyData<MemoizeThing>,
+}
+
+#[memoize]
+fn const_123(obj: &MemoizeThing) -> i32 {
+    obj.num_reads
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    123
+}
+
+#[memoize]
+fn const_123_sqr(obj: &MemoizeThing) -> i32 {
+    obj.num_reads
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    const_123(obj) * const_123(obj)
+}
+
+#[memoize(share)]
+fn const_mutex_hello(obj: &MemoizeThing) -> &Mutex<&'static str> {
+    Mutex::new("Hello")
+}
+
+#[test]
+fn test_memoize() {
+    let obj = MemoizeThing {
+        num_reads: AtomicUsize::new(0),
+        prop_data: PropertyData::new(),
+    };
+    assert_eq!(const_123(&obj), 123);
+    assert_eq!(obj.num_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(const_123(&obj), 123);
+    assert_eq!(obj.num_reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(const_123_sqr(&obj), 15129);
+    assert_eq!(obj.num_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(const_123_sqr(&obj), 15129);
+    assert_eq!(obj.num_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(*const_mutex_hello(&obj).lock().unwrap(), "Hello");
+    *const_mutex_hello(&obj).lock().unwrap() = "World";
+    assert_eq!(*const_mutex_hello(&obj).lock().unwrap(), "World");
 }
